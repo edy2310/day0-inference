@@ -5,23 +5,29 @@ day0 relies on (§19.3): token-id prompts are counted exactly, ``prompt_logprobs
 shape and contains the actual token, ``return_tokens_as_token_ids`` parses, and streamed chunks
 carry cumulative usage.
 
+The server is started once per module. Each test creates its own client inside its own
+``asyncio.run``, because an httpx client must not outlive the event loop that used it.
+
 Run it on a GPU host:  DAY0_GPU_TESTS=1 .venv/bin/pytest -q tests/gpu
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import shutil
 import socket
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 import pytest
 
 from day0.backends import VLLMBackend
-from day0.backends.base import BackendContext
+from day0.backends.base import BackendContext, ServerHandle
 from day0.client import InferenceClient
 from day0.config import BackendConfig, ServerConfig
+from day0.parsing import parse_completion
 
 pytestmark = [
     pytest.mark.gpu,
@@ -32,6 +38,7 @@ pytestmark = [
 ]
 SMOKE_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 TOP_K = 5
+Action = Callable[[InferenceClient], Awaitable[None]]
 
 
 def _free_port() -> int:
@@ -45,22 +52,39 @@ def _free_port() -> int:
         return int(probe.getsockname()[1])
 
 
+def _in_client(handle: ServerHandle, action: Action) -> None:
+    """Run one action with a fresh client, inside its own event loop.
+
+    Args:
+        handle: Handle of the running server.
+        action: Coroutine function that receives the client.
+    """
+
+    async def run() -> None:
+        client = InferenceClient(handle.base_url, handle.served_model, max_connections=4)
+        try:
+            await action(client)
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
 @pytest.fixture(scope="module")
-def vllm_client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[InferenceClient]:
-    """Start a vLLM server for the module and yield a client for it.
+def vllm_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ServerHandle]:
+    """Start one vLLM server for the module and stop it afterwards.
 
     Args:
         tmp_path_factory: Factory for module-scoped temporary directories.
 
     Yields:
-        A client connected to the server.
+        The handle of the running server.
     """
-    port = _free_port()
     cfg = BackendConfig.model_validate(
         {
             "kind": "vllm",
             "executable": "vllm",
-            "port": port,
+            "port": _free_port(),
             "startup_timeout_s": 900,
             "cooldown_s": 0,
         }
@@ -70,46 +94,55 @@ def vllm_client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[InferenceC
     )
     backend = VLLMBackend(cfg, context)
     log = tmp_path_factory.mktemp("vllm") / "server.log"
-    import asyncio
-
     handle = asyncio.run(backend.start(ServerConfig(name="smoke"), log))
-    client = InferenceClient(handle.base_url, handle.served_model, max_connections=4)
     try:
-        yield client
+        yield handle
     finally:
-        asyncio.run(client.aclose())
         asyncio.run(backend.stop(handle))
 
 
-def test_token_id_prompts_are_counted_exactly(vllm_client: InferenceClient) -> None:
+def test_endpoints_answer(vllm_server: ServerHandle) -> None:
+    """Health, version, and metrics endpoints respond on the real server.
+
+    Args:
+        vllm_server: Handle of the smoke server.
+    """
+
+    async def check(client: InferenceClient) -> None:
+        assert await client.health()
+        assert await client.version() is not None
+        assert await client.metrics_text() is not None
+
+    _in_client(vllm_server, check)
+
+
+def test_token_id_prompts_are_counted_exactly(vllm_server: ServerHandle) -> None:
     """The server counts exactly the token ids that were sent (no double BOS).
 
     Args:
-        vllm_client: Client connected to the smoke server.
+        vllm_server: Handle of the smoke server.
     """
-    import asyncio
 
-    async def run() -> None:
-        ids = await vllm_client.tokenize_chat([{"role": "user", "content": "Say hi."}])
-        result = await vllm_client.complete(
+    async def check(client: InferenceClient) -> None:
+        ids = await client.tokenize_chat([{"role": "user", "content": "Say hi."}])
+        result = await client.complete(
             ids, max_tokens=4, logprobs=None, prompt_logprobs=None, seed=1
         )
         assert result.prompt_tokens == len(ids)
 
-    asyncio.run(run())
+    _in_client(vllm_server, check)
 
 
-def test_prompt_logprobs_shape_and_actual_token(vllm_client: InferenceClient) -> None:
+def test_prompt_logprobs_shape_and_actual_token(vllm_server: ServerHandle) -> None:
     """Position 0 is null, each position has the actual token, and there are at most k + 1 entries.
 
     Args:
-        vllm_client: Client connected to the smoke server.
+        vllm_server: Handle of the smoke server.
     """
-    import asyncio
 
-    async def run() -> None:
-        ids = await vllm_client.tokenize_text("The quick brown fox.", add_special_tokens=True)
-        result = await vllm_client.complete(
+    async def check(client: InferenceClient) -> None:
+        ids = await client.tokenize_text("The quick brown fox.", add_special_tokens=True)
+        result = await client.complete(
             ids, max_tokens=1, logprobs=None, prompt_logprobs=TOP_K, seed=1
         )
         rows = result.prompt_topk
@@ -121,45 +154,43 @@ def test_prompt_logprobs_shape_and_actual_token(vllm_client: InferenceClient) ->
             assert ids[position] in row
             assert len(row) <= TOP_K + 1
 
-    asyncio.run(run())
+    _in_client(vllm_server, check)
 
 
-def test_generation_top_k_and_token_ids_parse(vllm_client: InferenceClient) -> None:
+def test_generation_top_k_and_token_ids_parse(vllm_server: ServerHandle) -> None:
     """With ``return_tokens_as_token_ids`` the output ids and top-k parse as integers.
 
     Args:
-        vllm_client: Client connected to the smoke server.
+        vllm_server: Handle of the smoke server.
     """
-    import asyncio
 
-    async def run() -> None:
-        ids = await vllm_client.tokenize_chat([{"role": "user", "content": "Name a colour."}])
-        result = await vllm_client.complete(
+    async def check(client: InferenceClient) -> None:
+        ids = await client.tokenize_chat([{"role": "user", "content": "Name a colour."}])
+        result = await client.complete(
             ids, max_tokens=6, logprobs=TOP_K, prompt_logprobs=None, seed=1
         )
         assert result.output_ids is not None
         assert result.gen_topk is not None
         assert len(result.gen_topk) == len(result.output_ids)
 
-    asyncio.run(run())
+    _in_client(vllm_server, check)
 
 
-def test_streaming_usage_is_cumulative(vllm_client: InferenceClient) -> None:
+def test_streaming_usage_is_cumulative(vllm_server: ServerHandle) -> None:
     """With ``continuous_usage_stats`` the streamed chunk counts are exact.
 
     Args:
-        vllm_client: Client connected to the smoke server.
+        vllm_server: Handle of the smoke server.
     """
-    import asyncio
 
-    async def run() -> None:
-        ids = await vllm_client.tokenize_text("Count to ten.", add_special_tokens=True)
-        result = await vllm_client.stream_complete(ids, max_tokens=16, seed=1, ignore_eos=True)
+    async def check(client: InferenceClient) -> None:
+        ids = await client.tokenize_text("Count to ten.", add_special_tokens=True)
+        result = await client.stream_complete(ids, max_tokens=16, seed=1, ignore_eos=True)
         assert result.ok, result.error
         assert result.chunk_counts_exact
         assert sum(result.chunk_tokens) == result.output_tokens
 
-    asyncio.run(run())
+    _in_client(vllm_server, check)
 
 
 def test_fixtures_are_consistent_when_present(repo_root: Path) -> None:
@@ -168,10 +199,6 @@ def test_fixtures_are_consistent_when_present(repo_root: Path) -> None:
     Args:
         repo_root: Repository root.
     """
-    import json
-
-    from day0.parsing import parse_completion
-
     fixtures = repo_root / "tests" / "fixtures" / "vllm"
     captured = sorted(fixtures.glob("completion_prompt_logprobs.json"))
     if not captured:
