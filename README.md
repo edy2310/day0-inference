@@ -4,8 +4,6 @@ Find the fastest LLM serving configuration that is still quality-equivalent to t
 
 <!-- RESULTS: fill after a real GPU run. Placeholder until results/published/llama31-8b-h100 exists. -->
 
-## Recommendation (placeholder)
-
 <!-- RESULTS: copy the recommendation box from results/published/llama31-8b-h100/card.md once a
 real run is published. Nothing in this section is a measurement yet. -->
 
