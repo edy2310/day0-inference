@@ -3,8 +3,9 @@
 Sources and licences:
 
 * ``gsm8k_200.jsonl``: 200 items sampled with a fixed seed from the test split of GSM8K
-  (https://huggingface.co/datasets/openai/gsm8k, MIT licence). The script does not download the
-  dataset. Pass the official ``test.jsonl`` with ``--gsm8k-jsonl``. Gold = the number after ``####``.
+  (https://huggingface.co/datasets/openai/gsm8k, config ``main``, MIT licence). Choose one source:
+  ``--gsm8k-from-hub`` downloads the split with the ``datasets`` library (install it first), and
+  ``--gsm8k-jsonl PATH`` reads a local copy of the same split. Gold = the number after ``####``.
 * ``longctx_synth.jsonl``: synthetic. Filler text from the built-in word list (``day0.corpus``),
   with 10 to 30 embedded facts per document. Generated here, so no external data is used.
 * ``chat_open_100.jsonl``: 100 original prompts written for this project (see ``CHAT_OPEN_PROMPTS``).
@@ -14,7 +15,9 @@ The build is deterministic. The same seed and inputs produce byte-identical file
 at run time.
 
 Usage:
-    python scripts/build_suites.py [--gsm8k-jsonl PATH] [--output-dir DIR]
+    python scripts/build_suites.py --gsm8k-from-hub
+    python scripts/build_suites.py --gsm8k-jsonl PATH [--output-dir DIR]
+    python scripts/build_suites.py                      # synthetic and chat suites only
 """
 
 from __future__ import annotations
@@ -352,24 +355,58 @@ CHAT_OPEN_PROMPTS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _gsm8k_items(source: Path, rng: np.random.Generator) -> list[dict[str, object]]:
-    """Sample GSM8K items from the official test split.
+GSM8K_HUB_DATASET = "openai/gsm8k"
+GSM8K_HUB_CONFIG = "main"
+
+
+def _read_gsm8k_jsonl(source: Path) -> list[dict[str, str]]:
+    """Read a local copy of the GSM8K test split.
 
     Args:
-        source: The official ``test.jsonl`` with ``question`` and ``answer`` fields.
+        source: JSONL file with ``question`` and ``answer`` fields.
+
+    Returns:
+        One dictionary per line.
+    """
+    return [
+        json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+
+
+def _read_gsm8k_hub() -> list[dict[str, str]]:
+    """Download the GSM8K test split from the Hugging Face hub with the ``datasets`` library.
+
+    Returns:
+        One dictionary per example, with ``question`` and ``answer`` fields.
+
+    Raises:
+        SystemExit: If the ``datasets`` package is not installed.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise SystemExit(
+            "--gsm8k-from-hub needs the datasets package: uv pip install 'datasets>=2.19'"
+        ) from exc
+    dataset = load_dataset(GSM8K_HUB_DATASET, GSM8K_HUB_CONFIG, split="test")
+    return [{"question": str(row["question"]), "answer": str(row["answer"])} for row in dataset]
+
+
+def _gsm8k_items(rows: list[dict[str, str]], rng: np.random.Generator) -> list[dict[str, object]]:
+    """Sample GSM8K items from the test split.
+
+    Args:
+        rows: The test split, with ``question`` and ``answer`` fields.
         rng: Seeded generator.
 
     Returns:
         ``GSM8K_SAMPLE`` items with ids ``gsm8k-0001`` onwards.
 
     Raises:
-        ValueError: If the file has fewer items than the sample size.
+        ValueError: If there are fewer rows than the sample size.
     """
-    rows = [
-        json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()
-    ]
     if len(rows) < GSM8K_SAMPLE:
-        raise ValueError(f"{source} has {len(rows)} rows; need at least {GSM8K_SAMPLE}")
+        raise ValueError(f"GSM8K split has {len(rows)} rows; need at least {GSM8K_SAMPLE}")
     chosen = sorted(rng.choice(len(rows), size=GSM8K_SAMPLE, replace=False).tolist())
     items: list[dict[str, object]] = []
     for number, index in enumerate(chosen, start=1):
@@ -496,23 +533,34 @@ def write_jsonl(path: Path, items: list[dict[str, object]]) -> None:
 def main() -> None:
     """Parse arguments and write every suite that can be built here."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
         "--gsm8k-jsonl",
         type=Path,
         default=None,
-        help="Official GSM8K test.jsonl. Without it, gsm8k_200.jsonl is skipped.",
+        help="Local copy of the GSM8K test split (JSONL with question and answer fields).",
+    )
+    source.add_argument(
+        "--gsm8k-from-hub",
+        action="store_true",
+        help="Download the GSM8K test split with the datasets library (needs internet).",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     args = parser.parse_args()
     output: Path = args.output_dir
 
     rng = np.random.default_rng(SEED)
+    rows: list[dict[str, str]] | None = None
     if args.gsm8k_jsonl is not None:
-        gsm8k = _gsm8k_items(args.gsm8k_jsonl, np.random.default_rng(SEED))
+        rows = _read_gsm8k_jsonl(args.gsm8k_jsonl)
+    elif args.gsm8k_from_hub:
+        rows = _read_gsm8k_hub()
+    if rows is not None:
+        gsm8k = _gsm8k_items(rows, np.random.default_rng(SEED))
         write_jsonl(output / "gsm8k_200.jsonl", gsm8k)
         print(f"wrote {len(gsm8k)} items to {output / 'gsm8k_200.jsonl'}")
     else:
-        print("skipped gsm8k_200.jsonl: pass --gsm8k-jsonl PATH with the official test split")
+        print("skipped gsm8k_200.jsonl: pass --gsm8k-from-hub or --gsm8k-jsonl PATH")
 
     longctx = _longctx_items(rng)
     write_jsonl(output / "longctx_synth.jsonl", longctx)
