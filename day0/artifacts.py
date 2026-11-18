@@ -12,6 +12,7 @@ import json
 import math
 import os
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -309,4 +310,108 @@ def decode_candidate(row: Mapping[str, Any]) -> CandidateRecord:
             else None
         ),
         metrics=decode_metrics(row["metrics"]),
+    )
+
+
+@dataclass(frozen=True)
+class LoadedReference:
+    """The reference artifacts of a run, as read from ``reference/``.
+
+    Attributes:
+        path: Directory the artifacts were read from.
+        records: Reference quality records, in item order.
+        perf: Contents of ``perf.json``, or ``None`` when the perf phase was skipped.
+        noise_floor: Contents of ``noise_floor.json``, or ``None``.
+        fingerprint: Contents of ``fingerprint.json``.
+        status: Contents of ``status.json``.
+    """
+
+    path: Path
+    records: list[ReferenceRecord]
+    perf: dict[str, Any] | None
+    noise_floor: dict[str, Any] | None
+    fingerprint: dict[str, Any]
+    status: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LoadedCandidate:
+    """The artifacts of one candidate, as read from ``candidates/<name>/``.
+
+    Attributes:
+        name: Candidate name.
+        path: Directory the artifacts were read from.
+        records: Candidate quality records, in item order.
+        perf: Contents of ``perf.json``, or ``None``.
+        determinism: Contents of ``determinism.json``, or ``None``.
+        status: Contents of ``status.json`` (``status``, ``error``, timing, flags).
+    """
+
+    name: str
+    path: Path
+    records: list[CandidateRecord]
+    perf: dict[str, Any] | None
+    determinism: dict[str, Any] | None
+    status: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def error(self) -> str | None:
+        """The error message when the candidate failed, otherwise ``None``."""
+        if self.status.get("status") == "ERROR":
+            return str(self.status.get("error") or "unknown error")
+        return None
+
+
+def _optional_json(path: Path) -> Any:
+    """Read a JSON file if it exists.
+
+    Args:
+        path: File to read.
+
+    Returns:
+        The decoded value, or ``None`` when the file is absent.
+    """
+    return read_json(path) if path.is_file() else None
+
+
+def load_reference(path: Path) -> LoadedReference:
+    """Load the reference artifacts from a reference directory.
+
+    Args:
+        path: The ``reference/`` directory.
+
+    Returns:
+        The loaded artifacts.
+    """
+    quality = path / "quality.jsonl.gz"
+    records = [decode_reference(row) for row in read_jsonl_gz(quality)] if quality.is_file() else []
+    return LoadedReference(
+        path=path,
+        records=records,
+        perf=_optional_json(path / "perf.json"),
+        noise_floor=_optional_json(path / "noise_floor.json"),
+        fingerprint=dict(_optional_json(path / "fingerprint.json") or {}),
+        status=dict(_optional_json(path / "status.json") or {}),
+    )
+
+
+def load_candidate(name: str, path: Path) -> LoadedCandidate:
+    """Load the artifacts of one candidate.
+
+    Args:
+        name: Candidate name.
+        path: The ``candidates/<name>/`` directory.
+
+    Returns:
+        The loaded artifacts. Quality records are empty when the file is absent.
+    """
+    quality = path / "quality.jsonl.gz"
+    records = [decode_candidate(row) for row in read_jsonl_gz(quality)] if quality.is_file() else []
+    return LoadedCandidate(
+        name=name,
+        path=path,
+        records=records,
+        perf=_optional_json(path / "perf.json"),
+        determinism=_optional_json(path / "determinism.json"),
+        status=dict(_optional_json(path / "status.json") or {}),
     )

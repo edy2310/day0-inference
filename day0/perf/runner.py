@@ -206,3 +206,38 @@ async def run_sweep(
     if last_after is not None:
         result.cache_usage = cache_usage(last_after)
     return result
+
+
+def perf_document(sweep: SweepResult, cfg: Day0Config) -> dict[str, object]:
+    """Build the ``perf.json`` document for one configuration.
+
+    The target summary is the level at ``perf.target_concurrency``. The maximum concurrency that
+    meets the SLO is the largest level whose ``slo_met`` is true, or ``None``.
+
+    Args:
+        sweep: Outcome of :func:`run_sweep`.
+        cfg: Validated configuration.
+
+    Returns:
+        A JSON-compatible document.
+    """
+    target: dict[str, object] | None = None
+    meeting: list[int] = []
+    for level in sweep.levels:
+        if level["concurrency"] == cfg.perf.target_concurrency:
+            target = level
+        if level["slo_met"] is True:
+            concurrency = level["concurrency"]
+            if isinstance(concurrency, int):
+                meeting.append(concurrency)
+    return {
+        "schema_version": 1,
+        "target_concurrency": cfg.perf.target_concurrency,
+        "levels": sweep.levels,
+        "target": target,
+        "max_concurrency_meeting_slo": max(meeting) if meeting else None,
+        "spec_decode": sweep.spec_decode,
+        "cache_usage": sweep.cache_usage,
+        "warmup_requests": cfg.perf.warmup_requests,
+        "requests_per_level": cfg.perf.requests_per_level,
+    }

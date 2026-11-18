@@ -457,11 +457,13 @@ def _format_validation_error(exc: ValidationError) -> str:
     return "\n".join(lines)
 
 
-def load_config(path: Path) -> Day0Config:
+def load_config(path: Path, *, check_suites: bool = True) -> Day0Config:
     """Load, validate, and anchor a YAML configuration file.
 
     Args:
         path: Path to the YAML file.
+        check_suites: If false, suite files are not checked for existence. Reports use this when
+            they read a stored run whose suite files may have moved.
 
     Returns:
         The validated configuration, with ``base_dir`` set to the YAML file's directory.
@@ -490,6 +492,8 @@ def load_config(path: Path) -> Day0Config:
 
     base_dir = path.resolve().parent
     cfg.base_dir = base_dir
+    if not check_suites:
+        return cfg
     for suite in cfg.quality.suites:
         suite_file = resolve_path(cfg, suite.path)
         if not suite_file.is_file():
