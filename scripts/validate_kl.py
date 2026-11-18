@@ -1,26 +1,29 @@
 """Measure how far the top-k KL estimator is from the exact full-vocabulary KL (§16).
 
-This script is offline and CPU-only. It is not run in CI. It needs the ``validate`` extra
-(``torch`` and ``transformers``), and it downloads the model named by ``--model``. It writes
-``docs/kl_validation.md``.
+This script is offline and is not run in CI. It needs the ``validate`` extra (``torch`` and
+``transformers`` 5.x), and it downloads the model named by ``--model``. It runs on the first GPU
+when one is visible and on the CPU otherwise. It writes ``docs/kl_validation.md``.
 
-For each prompt it generates greedily in float32, then runs teacher-forced passes with:
-  (a) float32 (the reference),
-  (b) bfloat16,
-  (c) float32 with Gaussian weight noise, sigma = 1e-3 times the standard deviation of each tensor.
+For each prompt it generates ``N_TOKENS`` tokens greedily (no repetition penalty) in float32. That
+sequence is the reference. Teacher-forced passes over the same sequence then use:
+  (a) bfloat16 weights,
+  (b) float32 weights with Gaussian noise, sigma = 1e-3 times the standard deviation of each tensor.
 
-At every position it computes the exact KL from full logits and the top-k estimate for k in
-{5, 10, 20}. The document reports correlations and error statistics per perturbation and k.
+At every generated position it computes the exact KL from the full distributions and the top-k
+estimate for k in {5, 10, 20}. The document reports correlations and error statistics, per
+perturbation and k, over the per-prompt means.
+
+The default model is small on purpose. The script holds three copies of the model at once, so an
+8B model needs about 80 GB for the weights alone.
 
 Usage:
-    python scripts/validate_kl.py [--model NAME] [--output docs/kl_validation.md]
+    python scripts/validate_kl.py [--model NAME] [--device cuda|cpu] [--output PATH]
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 import math
 import platform
 from pathlib import Path
@@ -40,10 +43,14 @@ N_TOKENS = 64
 KS = (5, 10, 20)
 SIGMA_REL = 1e-3
 SEED = 1234
+BF16 = "bfloat16"
+NOISY = "fp32 + weight noise"
 
 
 def _exact_kl(p: np.ndarray, q: np.ndarray) -> float:
     """Exact KL divergence between two full distributions, in nats.
+
+    Tokens with ``p == 0`` contribute nothing, by the convention ``0 log 0 = 0``.
 
     Args:
         p: Reference probabilities.
@@ -52,21 +59,61 @@ def _exact_kl(p: np.ndarray, q: np.ndarray) -> float:
     Returns:
         ``sum p * log(p / q)``.
     """
-    return float(np.sum(p * (np.log(p) - np.log(q))))
+    support = p > 0
+    return float(np.sum(p[support] * (np.log(p[support]) - np.log(q[support]))))
 
 
-def _topk(probs: np.ndarray, k: int) -> dict[int, float]:
+def _ranked(probs: np.ndarray, depth: int) -> np.ndarray:
+    """Token ids of the ``depth`` most probable tokens, most probable first.
+
+    A partial selection keeps the cost linear in the vocabulary size. Ties at the cut-off can be
+    resolved differently than by a full sort, but the same input always gives the same order.
+
+    Args:
+        probs: Probabilities over the vocabulary.
+        depth: Number of tokens to return. Must not exceed the vocabulary size.
+
+    Returns:
+        Token ids, of length ``depth``.
+    """
+    top = np.argpartition(-probs, depth - 1)[:depth]
+    return top[np.argsort(-probs[top], kind="stable")]
+
+
+def _topk(probs: np.ndarray, order: np.ndarray, k: int) -> dict[int, float]:
     """Top-k of a probability vector as token id to natural-log probability.
 
     Args:
         probs: Probabilities over the vocabulary.
+        order: Token ids from ``_ranked``, most probable first, with at least ``k`` entries.
         k: Number of tokens to keep.
 
     Returns:
         The top-k dictionary.
     """
-    order = np.argsort(-probs, kind="stable")[:k]
-    return {int(token): float(math.log(probs[token])) for token in order}
+    return {int(token): math.log(float(probs[token])) for token in order[:k]}
+
+
+def _prompt_means(ref_probs: np.ndarray, cand_probs: np.ndarray) -> dict[int, tuple[float, float]]:
+    """Per-prompt means of the exact KL and of the top-k estimate, for each k in ``KS``.
+
+    Args:
+        ref_probs: Reference distributions, one row per generated position.
+        cand_probs: Candidate distributions with the same shape.
+
+    Returns:
+        ``{k: (mean exact KL, mean top-k estimate)}``, in nats.
+    """
+    depth = max(KS)
+    exact: list[float] = []
+    estimate: dict[int, list[float]] = {k: [] for k in KS}
+    for p_row, q_row in zip(ref_probs, cand_probs, strict=True):
+        p_order = _ranked(p_row, depth)
+        q_order = _ranked(q_row, depth)
+        exact.append(_exact_kl(p_row, q_row))
+        for k in KS:
+            estimate[k].append(topk_kl(_topk(p_row, p_order, k), _topk(q_row, q_order, k)))
+    return {k: (float(np.mean(exact)), float(np.mean(estimate[k]))) for k in KS}
 
 
 def _pearson(x: np.ndarray, y: np.ndarray) -> float:
@@ -99,26 +146,31 @@ def _spearman(x: np.ndarray, y: np.ndarray) -> float:
     return _pearson(rank_x, rank_y)
 
 
-def _load(model_name: str, dtype: Any) -> tuple[Any, Any]:
-    """Load a tokenizer and a causal language model.
+def _load(model_name: str, dtype: Any, device: Any) -> tuple[Any, Any]:
+    """Load a tokenizer and a causal language model on one device.
 
     Args:
         model_name: Hugging Face model id or local path.
         dtype: Torch dtype for the weights.
+        device: Torch device to place the model on.
 
     Returns:
-        ``(tokenizer, model)`` in evaluation mode.
+        ``(tokenizer, model)`` with the model in evaluation mode.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype)
+    model.to(device)
     model.eval()
     return tokenizer, model
 
 
 def _prompt_ids(tokenizer: Any, messages: list[dict[str, str]]) -> list[int]:
     """Tokenize chat messages with the generation prompt.
+
+    ``return_dict=False`` is passed explicitly. In transformers 5 the tokenizer returns a
+    dictionary by default, and the token ids would then be the dictionary's keys.
 
     Args:
         tokenizer: Tokenizer with a chat template.
@@ -127,17 +179,22 @@ def _prompt_ids(tokenizer: Any, messages: list[dict[str, str]]) -> list[int]:
     Returns:
         Token ids.
     """
-    ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
-    return [int(t) for t in ids]
+    ids = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True, return_dict=False
+    )
+    if ids and isinstance(ids[0], list):  # a batch of one conversation
+        ids = ids[0]
+    return [int(token) for token in ids]
 
 
-def _probs(model: Any, ids: list[int], start: int) -> np.ndarray:
+def _probs(model: Any, ids: list[int], start: int, device: Any) -> np.ndarray:
     """Next-token distributions for the generated positions of one sequence.
 
     Args:
-        model: Causal language model.
+        model: Causal language model on ``device``.
         ids: Prompt plus generated tokens.
         start: Index of the first generated token.
+        device: Device of the model.
 
     Returns:
         Array of shape ``(n_generated, vocab)`` in float64.
@@ -145,10 +202,10 @@ def _probs(model: Any, ids: list[int], start: int) -> np.ndarray:
     import torch
 
     with torch.no_grad():
-        logits = model(torch.tensor([ids])).logits[0].to(torch.float64)
-    # The distribution that predicts token i is the row at position i - 1.
-    rows = logits[start - 1 : len(ids) - 1]
-    return torch.softmax(rows, dim=-1).numpy()
+        logits = model(torch.tensor([ids], device=device)).logits[0].to(torch.float64)
+        # The distribution that predicts token i is the row at position i - 1.
+        rows = logits[start - 1 : len(ids) - 1]
+        return torch.softmax(rows, dim=-1).cpu().numpy()
 
 
 def main() -> None:
@@ -157,61 +214,74 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--device",
+        choices=["cuda", "cpu"],
+        default=None,
+        help="default: cuda when a GPU is visible, otherwise cpu",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--suite", type=Path, default=DEFAULT_SUITE)
     args = parser.parse_args()
 
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(SEED)
-    tokenizer, ref_model = _load(args.model, torch.float32)
-    _, bf16_model = _load(args.model, torch.bfloat16)
-    _, noisy_model = _load(args.model, torch.float32)
+    tokenizer, ref_model = _load(args.model, torch.float32, device)
+    _, bf16_model = _load(args.model, torch.bfloat16, device)
+    _, noisy_model = _load(args.model, torch.float32, device)
+    # Noise is drawn on the CPU so that the same seed gives the same weights on any device.
     generator = torch.Generator().manual_seed(SEED)
     with torch.no_grad():
         for param in noisy_model.parameters():
             sigma = SIGMA_REL * float(param.std())
-            param.add_(torch.randn(param.shape, generator=generator) * sigma)
+            noise = torch.randn(param.shape, generator=generator) * sigma
+            param.add_(noise.to(device=param.device, dtype=param.dtype))
 
     items = load_suite(args.suite)[:N_PROMPTS]
     results: dict[str, dict[int, list[tuple[float, float]]]] = {
-        "bfloat16": {k: [] for k in KS},
-        "fp32 + weight noise": {k: [] for k in KS},
+        BF16: {k: [] for k in KS},
+        NOISY: {k: [] for k in KS},
     }
     for item in items:
         ids = _prompt_ids(tokenizer, item.messages)
-        with torch.no_grad():
-            generated = ref_model.generate(
-                torch.tensor([ids]), max_new_tokens=N_TOKENS, do_sample=False
-            )[0].tolist()
-        full = generated
         start = len(ids)
-        if len(full) <= start:
+        with torch.no_grad():
+            input_ids = torch.tensor([ids], device=device)
+            generated = ref_model.generate(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                max_new_tokens=N_TOKENS,
+                do_sample=False,
+                repetition_penalty=1.0,
+                pad_token_id=tokenizer.eos_token_id,
+            )[0].tolist()
+        if len(generated) <= start:
             continue
-        ref_probs = _probs(ref_model, full, start)
-        for name, model in (("bfloat16", bf16_model), ("fp32 + weight noise", noisy_model)):
-            cand_probs = _probs(model, full, start)
-            for k in KS:
-                exact: list[float] = []
-                estimate: list[float] = []
-                for p_row, q_row in zip(ref_probs, cand_probs, strict=True):
-                    exact.append(_exact_kl(p_row, q_row))
-                    estimate.append(topk_kl(_topk(p_row, k), _topk(q_row, k)))
-                results[name][k].append((float(np.mean(exact)), float(np.mean(estimate))))
+        ref_probs = _probs(ref_model, generated, start, device)
+        for name, model in ((BF16, bf16_model), (NOISY, noisy_model)):
+            means = _prompt_means(ref_probs, _probs(model, generated, start, device))
+            for k, pair in means.items():
+                results[name][k].append(pair)
 
-    lines = _render(args, results, len(items))
+    lines = _render(args, results, len(items), device)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"wrote {args.output}")
 
 
 def _render(
-    args: argparse.Namespace, results: dict[str, dict[int, list[tuple[float, float]]]], n_items: int
+    args: argparse.Namespace,
+    results: dict[str, dict[int, list[tuple[float, float]]]],
+    n_items: int,
+    device: Any,
 ) -> list[str]:
     """Render the validation document.
 
     Args:
         args: Parsed arguments.
         results: Per-prompt (exact, estimate) means, by perturbation and k.
-        n_items: Number of prompts that were available.
+        n_items: Number of prompts that were tried.
+        device: Device the models ran on.
 
     Returns:
         Lines of Markdown.
@@ -219,13 +289,16 @@ def _render(
     import torch
     import transformers
 
+    n_used = len(results[BF16][KS[0]])
+    hardware = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
     lines = [
         "# Top-k KL estimator validation",
         "",
         f"- Generated by `scripts/validate_kl.py` on {dt.datetime.now(dt.UTC).date().isoformat()}.",
         f"- Command: `python scripts/validate_kl.py --model {args.model}`",
-        f"- Model: `{args.model}`; prompts: {min(n_items, N_PROMPTS)} from `{args.suite.name}`; "
-        f"{N_TOKENS} greedy tokens each.",
+        f"- Model: `{args.model}`; prompts with generated tokens: {n_used} of {n_items} tried "
+        f"from `{args.suite.name}`; {N_TOKENS} greedy tokens each.",
+        f"- Device: {hardware}.",
         f"- Versions: Python {platform.python_version()}, torch {torch.__version__}, "
         f"transformers {transformers.__version__}.",
         "",
@@ -256,12 +329,6 @@ def _render(
                 f"{float(np.nanmedian(rel)):.3f} | {float(np.mean(estimate < exact)):.2f} |"
             )
         lines.append("")
-    lines.append(
-        "Raw per-prompt values: "
-        + json.dumps(
-            {name: {str(k): len(v) for k, v in by_k.items()} for name, by_k in results.items()}
-        )
-    )
     return lines
 
 
