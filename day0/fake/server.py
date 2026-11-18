@@ -24,18 +24,25 @@ from starlette.routing import Route
 
 from day0.fake.model import (
     EOS_ID,
+    TOKEN_TEXT,
     ModelParams,
     TurnPlan,
+    context_tails,
     decode,
     encode_text,
     greedy_token,
     log_softmax,
+    log_softmax_rows,
+    logits_rows,
     next_token_logits,
     plan_turn,
     render_chat,
     token_text,
     top_k_pairs,
+    top_k_rows,
 )
+
+_PROMPT_CHUNK = 4096
 
 FAKE_VERSION = "fake-0.1"
 _MILLISECONDS = 1000.0
@@ -150,7 +157,9 @@ class _Decoder:
             ignore_eos: Whether EOS is blocked.
             logprobs: Number of top logprobs to keep per token, or ``None``.
         """
-        self.seq = list(prompt)
+        self.buffer = np.zeros(len(prompt) + max_tokens, dtype=np.int64)
+        self.buffer[: len(prompt)] = prompt
+        self.length = len(prompt)
         self.plan = plan
         self.params = params
         self.max_tokens = max_tokens
@@ -173,7 +182,7 @@ class _Decoder:
             self._finished = True
             self.finish_reason = "length"
             return None
-        logits = next_token_logits(self.seq, len(self.seq), self.plan, self.params)
+        logits = next_token_logits(self.buffer, self.length, self.plan, self.params)
         token = greedy_token(logits, ignore_eos=self.ignore_eos)
         if token == EOS_ID and not self.ignore_eos:
             self._finished = True
@@ -185,7 +194,8 @@ class _Decoder:
                 top_k_pairs(lp, self.logprobs) if self.logprobs > 0 else [(token, float(lp[token]))]
             )
             self.logprob_rows.append((float(lp[token]), pairs))
-        self.seq.append(token)
+        self.buffer[self.length] = token
+        self.length += 1
         self.out.append(token)
         return token
 
@@ -229,13 +239,21 @@ def _logprobs_payload(
     }
 
 
-def _prompt_logprobs_payload(
-    ids: list[int], plan: TurnPlan, params: ModelParams, k: int
-) -> list[dict[str, Any] | None]:
-    """Score every prompt position, as ``prompt_logprobs`` does.
+_PROMPT_SENTINEL = "__day0_prompt_logprobs__"
+_JSON_TOKEN: tuple[str, ...] = tuple(json.dumps(text, ensure_ascii=False) for text in TOKEN_TEXT)
+
+
+def _prompt_logprobs_json(ids: list[int], plan: TurnPlan, params: ModelParams, k: int) -> str:
+    """JSON text of ``prompt_logprobs`` for a prompt.
 
     Position ``p`` describes the distribution for token ``ids[p]`` given ``ids[:p]``. It holds the
-    actual token plus the top-k tokens, so it can contain up to ``k + 1`` entries.
+    actual token plus the top-k tokens, so it can contain up to ``k + 1`` entries. The text has the
+    same structure as ``json.dumps`` of the equivalent dictionaries (checked by a unit test).
+
+    Where the distribution depends only on the 3-token context (before the assistant marker, and
+    with no position-dependent noise), each distinct context is computed once for the whole prompt.
+    Other positions are computed in chunks. The handler runs this in a thread, so the event loop
+    keeps serving requests.
 
     Args:
         ids: Prompt token ids.
@@ -244,28 +262,169 @@ def _prompt_logprobs_payload(
         k: Number of top tokens per position.
 
     Returns:
-        One entry per prompt position. Position 0 is ``None``.
+        A JSON array with one element per prompt position. Position 0 is ``null``.
     """
-    rows: list[dict[str, Any] | None] = [None]
-    for position in range(1, len(ids)):
-        logprobs = log_softmax(next_token_logits(ids, position, plan, params))
-        entries: dict[str, Any] = {}
-        for rank, (token_id, value) in enumerate(top_k_pairs(logprobs, k), start=1):
-            entries[str(token_id)] = {
-                "logprob": value,
-                "rank": rank,
-                "decoded_token": token_text(token_id),
-            }
-        actual = ids[position]
-        if str(actual) not in entries:
-            actual_lp = float(logprobs[actual])
-            entries[str(actual)] = {
-                "logprob": actual_lp,
-                "rank": int(np.sum(logprobs > actual_lp)) + 1,
-                "decoded_token": token_text(actual),
-            }
-        rows.append(entries)
-    return rows
+    n_positions = len(ids) - 1
+    if n_positions < 1:
+        return "[null]"
+    positions = np.arange(1, len(ids), dtype=np.int64)
+    actual = np.asarray(ids[1:], dtype=np.int64)
+    context_only = params.noise == 0 or params.long_ctx_factor == 0
+    if context_only:
+        if plan.assistant_end is not None:
+            shared = positions < plan.assistant_end
+        else:
+            shared = np.ones(n_positions, dtype=bool)
+    else:
+        shared = np.zeros(n_positions, dtype=bool)
+
+    pieces: list[str] = [""] * n_positions
+    shared_index = np.nonzero(shared)[0]
+    if shared_index.size:
+        _fill_shared(
+            ids,
+            plan,
+            params,
+            k,
+            positions[shared_index],
+            actual[shared_index],
+            shared_index,
+            pieces,
+        )
+    own_index = np.nonzero(~shared)[0]
+    for start in range(0, own_index.size, _PROMPT_CHUNK):
+        chosen = own_index[start : start + _PROMPT_CHUNK]
+        _fill_rows(ids, plan, params, k, positions[chosen], actual[chosen], chosen, pieces)
+    return "[null," + ",".join(pieces) + "]"
+
+
+def _fill_shared(
+    ids: list[int],
+    plan: TurnPlan,
+    params: ModelParams,
+    k: int,
+    positions: np.ndarray,
+    actual: np.ndarray,
+    slots: np.ndarray,
+    pieces: list[str],
+) -> None:
+    """Fill positions whose distribution depends only on their 3-token context.
+
+    Args:
+        ids: Prompt token ids.
+        plan: Turn plan of the prompt.
+        params: Model parameters.
+        k: Top-k size.
+        positions: Context lengths of the shared positions.
+        actual: Actual next token of each shared position.
+        slots: Index of each shared position in ``pieces``.
+        pieces: Output list, one entry per prompt position.
+    """
+    tails = context_tails(ids, positions)
+    unique, first, inverse_raw = np.unique(tails, axis=0, return_index=True, return_inverse=True)
+    inverse = inverse_raw.reshape(-1)
+    representatives = positions[first.reshape(-1)]
+    logprobs = log_softmax_rows(logits_rows(ids, representatives, plan, params))
+    top_ids, top_values = top_k_rows(logprobs, k)
+    sorted_rows = np.sort(logprobs, axis=1)
+    actual_lp = logprobs[inverse, actual]
+    actual_rank = np.zeros(positions.shape[0], dtype=np.int64)
+    for context in range(unique.shape[0]):
+        group = np.nonzero(inverse == context)[0]
+        at_or_below = np.searchsorted(sorted_rows[context], actual_lp[group], side="right")
+        actual_rank[group] = (sorted_rows.shape[1] - at_or_below) + 1
+
+    texts = [
+        _top_text(top_ids[context].tolist(), top_values[context].tolist())
+        for context in range(unique.shape[0])
+    ]
+    members = [set(top_ids[context].tolist()) for context in range(unique.shape[0])]
+    inverse_list = inverse.tolist()
+    actual_list = actual.tolist()
+    lp_list = actual_lp.tolist()
+    rank_list = actual_rank.tolist()
+    for row, slot in enumerate(slots.tolist()):
+        context = inverse_list[row]
+        token = actual_list[row]
+        if token in members[context]:
+            body = texts[context]
+        else:
+            entry = _entry_text(token, lp_list[row], rank_list[row])
+            body = f"{texts[context]},{entry}" if texts[context] else entry
+        pieces[slot] = "{" + body + "}"
+
+
+def _fill_rows(
+    ids: list[int],
+    plan: TurnPlan,
+    params: ModelParams,
+    k: int,
+    positions: np.ndarray,
+    actual: np.ndarray,
+    slots: np.ndarray,
+    pieces: list[str],
+) -> None:
+    """Fill positions whose distribution is computed one chunk at a time.
+
+    Args:
+        ids: Prompt token ids.
+        plan: Turn plan of the prompt.
+        params: Model parameters.
+        k: Top-k size.
+        positions: Context lengths of the positions.
+        actual: Actual next token of each position.
+        slots: Index of each position in ``pieces``.
+        pieces: Output list, one entry per prompt position.
+    """
+    logprobs = log_softmax_rows(logits_rows(ids, positions, plan, params))
+    top_ids, top_values = top_k_rows(logprobs, k)
+    rows = np.arange(positions.shape[0])
+    actual_lp = logprobs[rows, actual]
+    actual_rank = np.sum(logprobs > actual_lp[:, None], axis=1) + 1
+    id_rows = top_ids.tolist()
+    value_rows = top_values.tolist()
+    actual_list = actual.tolist()
+    lp_list = actual_lp.tolist()
+    rank_list = actual_rank.tolist()
+    for row, slot in enumerate(slots.tolist()):
+        token = actual_list[row]
+        parts = [_top_text(id_rows[row], value_rows[row])]
+        if token not in id_rows[row]:
+            parts.append(_entry_text(token, lp_list[row], rank_list[row]))
+        pieces[slot] = "{" + ",".join(part for part in parts if part) + "}"
+
+
+def _entry_text(token_id: int, logprob: float, rank: int) -> str:
+    """JSON text of one ``prompt_logprobs`` entry, ``"<id>":{...}``.
+
+    Args:
+        token_id: Token id used as the key.
+        logprob: Natural-log probability.
+        rank: One-based rank.
+
+    Returns:
+        The entry text.
+    """
+    return (
+        f'"{token_id}":{{"logprob":{logprob!r},"rank":{rank},'
+        f'"decoded_token":{_JSON_TOKEN[token_id]}}}'
+    )
+
+
+def _top_text(ids: list[int], values: list[float]) -> str:
+    """JSON text of the top-k entries of one distribution, without the braces.
+
+    Args:
+        ids: Token ids in rank order.
+        values: Log-probabilities in the same order.
+
+    Returns:
+        Comma-separated entries, or an empty string when there are none.
+    """
+    return ",".join(
+        _entry_text(token_id, value, rank)
+        for rank, (token_id, value) in enumerate(zip(ids, values, strict=True), start=1)
+    )
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -455,8 +614,12 @@ def create_app(config: FakeServerConfig) -> Starlette:
                 choice["logprobs"] = _logprobs_payload(
                     decoder.logprob_rows, decoder.out, return_ids
                 )
+            prompt_fragment: str | None = None
             if prompt_k is not None:
-                choice["prompt_logprobs"] = _prompt_logprobs_payload(ids, plan, params, prompt_k)
+                prompt_fragment = await asyncio.to_thread(
+                    _prompt_logprobs_json, ids, plan, params, prompt_k
+                )
+                choice["prompt_logprobs"] = _PROMPT_SENTINEL
             if first:
                 await asyncio.sleep(state.ttft_seconds(len(ids)))
             state.record_spec(len(decoder.out))
@@ -475,7 +638,11 @@ def create_app(config: FakeServerConfig) -> Starlette:
             "choices": [choice],
             "usage": usage,
         }
-        return JSONResponse(payload)
+        if prompt_fragment is None:
+            return JSONResponse(payload)
+        text = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        text = text.replace(f'"{_PROMPT_SENTINEL}"', prompt_fragment, 1)
+        return Response(text, media_type="application/json")
 
     async def _stream(
         ids: list[int],

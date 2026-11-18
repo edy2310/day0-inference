@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from day0.backends.process import (
+    HEALTH_POLL_S,
     port_is_free,
     read_served_model,
     start_process,
@@ -107,7 +108,13 @@ class Backend(ABC):
 
 
 class ProcessBackend(Backend):
-    """Common start and stop logic for backends that launch a process on a fixed port."""
+    """Common start and stop logic for backends that launch a process on a fixed port.
+
+    Attributes:
+        poll_interval_s: Seconds between health polls while a server starts.
+    """
+
+    poll_interval_s: float = HEALTH_POLL_S
 
     def __init__(self, cfg: BackendConfig, context: BackendContext) -> None:
         """Create the backend and an empty process table.
@@ -165,6 +172,7 @@ class ProcessBackend(Backend):
                 timeout_s=self.cfg.startup_timeout_s,
                 process=process,
                 log_path=log_path,
+                poll_interval_s=self.poll_interval_s,
             )
             served = await read_served_model(self.base_url, fallback=self.context.model_id)
         except BackendStartError:

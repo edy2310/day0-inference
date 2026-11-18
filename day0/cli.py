@@ -6,9 +6,13 @@ stderr and turn into exit code 2, as the specification requires for configuratio
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import shlex
+import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, TypeVar
 
 import typer
 
@@ -18,6 +22,8 @@ from day0.backends.base import ProcessBackend, backend_context_from
 from day0.backends.vllm import read_help_text, unknown_flags
 from day0.config import Day0Config, config_hash, load_config
 from day0.errors import Day0Error
+from day0.orchestrator import RunOptions, run_check, run_experiment
+from day0.report import render_run
 
 app = typer.Typer(
     name="day0",
@@ -27,6 +33,8 @@ app = typer.Typer(
 )
 
 EXIT_CONFIG_ERROR = 2
+EXIT_ERROR = 2
+_T = TypeVar("_T")
 
 
 def _version_callback(value: bool) -> None:
@@ -148,3 +156,174 @@ def fake_server(ctx: typer.Context) -> None:
     from day0.fake.server import main as fake_main
 
     fake_main(list(ctx.args))
+
+
+def _configure_logging(verbose: bool) -> None:
+    """Route day0 log messages to the terminal. Only ``--verbose`` shows the informational ones.
+
+    Args:
+        verbose: Whether ``--verbose`` was given.
+    """
+    from rich.logging import RichHandler
+
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(message)s",
+        handlers=[RichHandler(show_path=False, show_time=False)],
+        force=True,
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _guard(action: Callable[[], _T]) -> _T:
+    """Run an action and turn day0 and unexpected errors into exit code 2.
+
+    Args:
+        action: Callable that does the work.
+
+    Returns:
+        The action's result.
+
+    Raises:
+        typer.Exit: With code 2 when the action fails.
+    """
+    try:
+        return action()
+    except Day0Error as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_ERROR) from exc
+    except Exception as exc:  # unexpected: report and exit 2 (§14.3)
+        typer.echo(f"error: unexpected {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=EXIT_ERROR) from exc
+
+
+def _command_line() -> tuple[str, ...]:
+    """The command line as the user typed it, for reproduction.
+
+    Returns:
+        ``("day0", ...)`` followed by the arguments.
+    """
+    return ("day0", *sys.argv[1:])
+
+
+@app.command()
+def run(
+    config: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, help="YAML configuration.")
+    ],
+    out: Annotated[
+        Path | None, typer.Option("--out", help="Directory that receives the run directory.")
+    ] = None,
+    only: Annotated[
+        list[str] | None,
+        typer.Option("--only", help="Run only this candidate (repeatable)."),
+    ] = None,
+    reuse_reference: Annotated[
+        Path | None,
+        typer.Option("--reuse-reference", help="Reuse a stored reference/ directory."),
+    ] = None,
+    skip_perf: Annotated[bool, typer.Option("--skip-perf", help="Skip perf phases.")] = False,
+    skip_quality: Annotated[
+        bool, typer.Option("--skip-quality", help="Skip quality phases.")
+    ] = False,
+    capture_fixtures: Annotated[
+        bool,
+        typer.Option("--capture-fixtures", help="Save the first raw response of each kind."),
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show info logs.")] = False,
+) -> None:
+    """Run the reference and every candidate, then write the report.
+
+    Exit codes: 0 when a configuration is recommended, 1 when none is, 2 on errors.
+
+    Args:
+        config: Path to the YAML configuration.
+        out: Parent directory for the run directory.
+        only: Candidates to run. Empty means all enabled candidates.
+        reuse_reference: Stored reference directory to reuse.
+        skip_perf: Skip the performance phases.
+        skip_quality: Skip the quality phases.
+        capture_fixtures: Save the first raw response of each request kind.
+        verbose: Show informational logs.
+    """
+    _configure_logging(verbose)
+    cfg = _load_or_exit(config)
+    options = RunOptions(
+        out_dir=out,
+        only=tuple(only or ()),
+        reuse_reference=reuse_reference,
+        skip_perf=skip_perf,
+        skip_quality=skip_quality,
+        capture_fixtures=capture_fixtures,
+        command=_command_line(),
+    )
+    result = _guard(lambda: asyncio.run(run_experiment(cfg, options)))
+    typer.echo(f"run directory: {result.run_dir}")
+    typer.echo(f"card: {result.run_dir / 'card.md'}")
+    if result.recommendation is None:
+        typer.echo("recommendation: none")
+    else:
+        typer.echo(f"recommendation: {result.recommendation}")
+    raise typer.Exit(code=result.exit_code)
+
+
+@app.command()
+def check(
+    config: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, help="YAML configuration.")
+    ],
+    candidate: Annotated[str, typer.Option("--candidate", help="Candidate to run.")],
+    reference: Annotated[
+        Path,
+        typer.Option(
+            "--reference",
+            exists=True,
+            file_okay=False,
+            help="Stored reference directory (RUN_DIR/reference).",
+        ),
+    ],
+    out: Annotated[
+        Path | None, typer.Option("--out", help="Directory that receives the check run.")
+    ] = None,
+) -> None:
+    """Run one candidate against stored reference artifacts and gate it (CI gate).
+
+    Exit codes: 0 PASS, 1 any other status, 2 errors.
+
+    Args:
+        config: Path to the YAML configuration.
+        candidate: Candidate name.
+        reference: Stored reference directory.
+        out: Parent directory for the check run.
+    """
+    _configure_logging(False)
+    cfg = _load_or_exit(config)
+    run_dir, status, exit_code = _guard(
+        lambda: asyncio.run(
+            run_check(
+                cfg,
+                candidate_name=candidate,
+                reference_dir=reference,
+                out_dir=out,
+                command=_command_line(),
+            )
+        )
+    )
+    typer.echo(f"{candidate}: {status}")
+    typer.echo(f"run directory: {run_dir}")
+    raise typer.Exit(code=exit_code)
+
+
+@app.command()
+def report(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Run directory.")],
+) -> None:
+    """Rebuild card.md, card.json, and pareto.png from a run directory, without a GPU.
+
+    Args:
+        run_dir: The run directory.
+    """
+    _guard(lambda: render_run(run_dir))
+    typer.echo(f"card: {run_dir / 'card.md'}")
+    typer.echo(f"card data: {run_dir / 'card.json'}")
+    typer.echo(f"pareto: {run_dir / 'pareto.png'}")

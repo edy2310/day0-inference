@@ -29,7 +29,8 @@ candidates:
   # Exposes speculative-decoding counters on /metrics: should PASS with an acceptance summary.
   - {name: spec-fake,   args: ["--spec-accept-rate", "0.6", "--speedup", "1.1"]}
 quality:
-  top_k_logprobs: 20
+  # 5 keeps the demo fast: prompt logprobs are serialized per position. Real runs use 20.
+  top_k_logprobs: 5
   concurrency: 16
   prefill_concurrency: 8
   prefill_max_prompt_tokens: 16384

@@ -114,6 +114,8 @@ def parse_token_key(key: str | int) -> int:
     """
     if isinstance(key, int):
         return key
+    if key.isdigit():
+        return int(key)
     text = key.strip()
     if text.startswith(_TOKEN_PREFIX):
         text = text[len(_TOKEN_PREFIX) :]

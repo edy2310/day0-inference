@@ -6,6 +6,7 @@ always sent as prompts, so every configuration sees byte-identical inputs (§6.1
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Mapping, Sequence
@@ -20,6 +21,10 @@ from day0.parsing import TopK, aiter_sse_payloads, parse_completion, parse_prome
 
 ERROR_BODY_CHARS = 500
 _COMPLETIONS_PATH = "/v1/completions"
+# Connection-level failures before a response: a keep-alive connection the server closed, or a
+# reset. Retrying them is safe because every request is deterministic (greedy, seeded).
+_RETRYABLE = (httpx.ReadError, httpx.RemoteProtocolError, httpx.WriteError)
+POST_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -190,10 +195,18 @@ class InferenceClient:
         Raises:
             ServerResponseError: If the request could not be sent or completed.
         """
-        try:
-            return await self._http.post(path, json=dict(body))
-        except httpx.HTTPError as exc:
-            raise ServerResponseError(f"POST {path} failed: {exc}") from exc
+        last: BaseException | None = None
+        for attempt in range(POST_ATTEMPTS):
+            try:
+                return await self._http.post(path, json=dict(body))
+            except _RETRYABLE as exc:
+                last = exc
+                await asyncio.sleep(0.05 * (attempt + 1))
+            except httpx.HTTPError as exc:
+                raise ServerResponseError(f"POST {path} failed: {exc!r}") from exc
+        raise ServerResponseError(
+            f"POST {path} failed after {POST_ATTEMPTS} attempts: {last!r}"
+        ) from last
 
     async def _get(self, path: str) -> httpx.Response:
         """GET a path and wrap transport errors.

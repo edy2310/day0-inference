@@ -36,7 +36,13 @@ def build_fake_command(cfg: BackendConfig, server: ServerConfig) -> list[str]:
 
 
 class FakeBackend(ProcessBackend):
-    """Launches the fake OpenAI-compatible server."""
+    """Launches the fake OpenAI-compatible server.
+
+    The fake server starts in well under a second, so it is polled every 0.25 s instead of every
+    2 s (decision D-23). The vLLM backend keeps the specified 2 s.
+    """
+
+    poll_interval_s: float = 0.25
 
     def build_command(self, server: ServerConfig) -> list[str]:
         """Return the fake-server command for a server.
