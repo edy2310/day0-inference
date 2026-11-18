@@ -294,6 +294,8 @@ Format: context, decision, consequence.
 - **Consequence:** The 90 s target is not met here. To meet it, reduce the long-context bucket of
   the fake suite, or make the fake server return prompt logprobs only for the requested positions
   (a deviation from the vLLM response shape). Either change must be recorded here first.
+- **Later:** With the virtual clock (D-39) the fake server no longer sleeps, and the module takes
+  about two minutes on this sandbox. The 90 s target is still not met.
 
 ## D-34: vLLM 0.34.0 is the default, with a driver check
 
