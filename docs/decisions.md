@@ -185,3 +185,110 @@ Format: context, decision, consequence.
 - **Decision:** `hostname_hash` is the first twelve hex characters of SHA-256 of the host name.
   The git commit is stored in `run.json`, not in `env.json`.
 - **Consequence:** `env.json` does not reveal the machine name, and each field is best effort.
+
+## D-22: Vectorized, context-keyed fake model
+
+- **Context:** A one-generator-per-position model needed about 18 µs per prompt position. A
+  prompt-logprob pass over the demo suite then took about 10 s per candidate, and a per-position
+  `default_rng` made the server block its event loop.
+- **Decision:** The base logits and the candidate perturbation come from a counter-based
+  SplitMix64 hash, mapped to normals with Box-Muller. The value depends only on the seeds and the
+  3-token context, so one position gives the same logits alone or in a batch (unit-tested).
+  Distributions for context-only positions (before the assistant marker, with no
+  position-dependent noise) are computed once per distinct context per prompt.
+- **Consequence:** The fake model's random streams differ from the first implementation. All
+  outcomes in §18.1 were recalibrated against the new streams, and they hold.
+
+## D-23: Faster health polling for the fake backend
+
+- **Context:** §7.2 polls `/health` every 2 s. The fake server starts in well under a second, so the
+  demo spent about 2 s per server on the first poll.
+- **Decision:** `FakeBackend` polls every 0.25 s. `VLLMBackend` keeps the specified 2 s.
+- **Consequence:** Nine server starts in the end-to-end test save about 15 s.
+
+## D-24: `top_k_logprobs: 5` in the demo configuration
+
+- **Context:** Prompt logprobs carry `k + 1` entries per position. With the demo's ~400k prompt
+  positions, `k = 20` produced about 160 MB of JSON per candidate, which made the demo impractical.
+- **Decision:** `examples/fake.yaml` uses `top_k_logprobs: 5` and says so in a comment. The real
+  configuration keeps 20, and the unit tests cover the estimator at any k.
+- **Consequence:** The demo's outcomes are the same, and its run time is lower.
+
+## D-25: Connection-level retries on POST
+
+- **Context:** A server that computes on its event loop for seconds lets uvicorn close idle
+  keep-alive connections. The client then reused one and failed with an empty `ReadError`. Every
+  request is deterministic (greedy, seeded), so repeating one that never produced a response is
+  safe.
+- **Decision:** `InferenceClient._post` retries `ReadError`, `RemoteProtocolError`, and `WriteError`
+  up to three times, with a short back-off. Other HTTP errors are raised at once.
+- **Consequence:** Real servers that close idle connections are handled the same way.
+
+## D-26: Prompt logprobs are computed off the event loop
+
+- **Context:** The server computed prompt logprobs synchronously in the request handler.
+- **Decision:** The handler runs the computation with `asyncio.to_thread`, so other requests keep
+  being served while a long prompt is scored.
+- **Consequence:** Concurrency in the demo behaves as intended, and the failure described in D-25
+  does not recur.
+
+## D-27: No quality records means `INSUFFICIENT_DATA`
+
+- **Context:** `--skip-quality` produces candidates with no quality records. An empty evaluation
+  would otherwise reach `PASS`.
+- **Decision:** A candidate with no quality records is `INSUFFICIENT_DATA`.
+- **Consequence:** A perf-only run cannot be mistaken for a gated pass.
+
+## D-28: `run.json` is final before the card is rendered; `check` reads the given reference
+
+- **Context:** The first end-to-end run wrote `ended_utc` after rendering, so `day0 report` produced
+  a different card from the same run directory. `check` also read the perf workload from its own
+  run directory, which does not contain it.
+- **Decision:** `run.json` is written in its final form before `render_run`. The candidate phase
+  reads the workload from the reference directory it was given (the run's own `reference/` for
+  `run`, and `--reference` for `check`).
+- **Consequence:** `day0 report` reproduces `card.md` byte for byte, and `check` works against a
+  stored reference, as §15.1 describes.
+
+## D-29: Card and report layout
+
+- **Context:** §17.1 fixes the sections. §17.2 says `card.json` holds the same content.
+- **Decision:** `card.json` is the report data itself, unrounded. `card.md` is rendered from it.
+  Each candidate also gets `candidates/<name>/summary.json` with its per-slice aggregates, gate
+  result, and errors, as §15.2 lists. Intervals are shown as `[lo, hi]`.
+- **Consequence:** Anything the card shows can be checked in `card.json`.
+
+## D-30: `check` writes a check record, not a card
+
+- **Context:** §15.1 says `check` runs one candidate and gates it. It does not ask for a card.
+- **Decision:** `check` writes `candidates/<name>/check.json` with the gate result, and it exits 0
+  for PASS, 1 for any other status, and 2 for errors. It does not render a card or the Pareto chart.
+- **Consequence:** A CI gate stays fast and does not need the other configurations.
+
+## D-31: Suite builder
+
+- **Context:** §9.4 asks for three committed suites, with deterministic builds.
+- **Decision:** `scripts/build_suites.py` builds `longctx_synth.jsonl` (100 items, about 5 MB) and
+  `chat_open_100.jsonl` (100 original prompts, stored in the script). It builds
+  `gsm8k_200.jsonl` only when given the official file with `--gsm8k-jsonl` (see D-04). Two builds
+  produce byte-identical files, which was checked.
+- **Consequence:** The suites are reproducible, and the 5 MB file is the largest committed artifact.
+
+## D-32: Validation script not run
+
+- **Context:** §16 asks for `scripts/validate_kl.py` and `docs/kl_validation.md`. The script needs
+  `torch` and `transformers`, and downloads the model from Hugging Face, which is blocked here.
+- **Decision:** The script is written as specified and is not run. `docs/kl_validation.md` is a
+  placeholder that says so.
+- **Consequence:** Nothing in the repository claims a measured estimator error.
+
+## D-33: End-to-end test duration
+
+- **Context:** §19.2 requires the end-to-end test to finish in under 90 s on a CI runner.
+- **Decision:** The test is kept as specified. On this 4-vCPU sandbox it takes several minutes,
+  because the fake server serializes full prompt logprobs for ~400k positions per candidate, and
+  each candidate also runs a full prefill pass. The remaining time is in JSON transfer and parsing,
+  which the specified response shape requires.
+- **Consequence:** The 90 s target is not met here. To meet it, reduce the long-context bucket of
+  the fake suite, or make the fake server return prompt logprobs only for the requested positions
+  (a deviation from the vLLM response shape). Either change must be recorded here first.
