@@ -153,7 +153,9 @@ estimate with the Wilson interval as error bars.
 
 ## Performance metrics (§11.3)
 
-All times are in milliseconds, measured with `time.perf_counter_ns()`.
+All times are in milliseconds. Real servers are timed with `time.perf_counter_ns()`. The fake server
+is timed on its virtual clock: its times are simulated from the §13.3 formulas, not measured, and
+they do not depend on the machine (decision D-39).
 
 - `TTFT = first content chunk - send`. `E2E = end - send`.
 - `TPOT = (end - first chunk) / (output_tokens - 1)`. Undefined for one-token outputs.

@@ -46,7 +46,8 @@ result.
 ## Fake server
 
 - **The fake server measures nothing about real models.** Its logits come from a toy function of
-  the last three tokens. Its latencies come from a formula. Its outcomes in the demo are fixed by
+  the last three tokens. Its latencies come from a formula on a virtual clock: they are simulated,
+  not measured, and they do not depend on the machine (D-39). Its outcomes in the demo are fixed by
   construction and exist to test the pipeline.
 - **Its prompt logprobs are slow to serialize.** Each position carries k+1 entries, so the demo uses
   `top_k_logprobs: 5`. Real runs use 20.

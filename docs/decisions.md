@@ -371,3 +371,28 @@ Format: context, decision, consequence.
 - **Consequence:** Under load, `make test` can fail on that one line without any code change.
   Making the fake server's timing independent of the machine would remove this. That is a change to
   the fake model's timing, so it is not made here.
+- **Later:** Superseded by D-39. The fake server no longer depends on the machine it runs on.
+
+## D-39: The fake server is timed on a virtual clock
+
+- **Context:** The fake server slept for the simulated times of §13.3, and the load generator
+  measured wall-clock times. The measured numbers therefore included the CPU time of each decoding
+  step, which depends on the machine and on the load. Candidates with noise do more work per token,
+  because the perturbation draws 512 Gaussians per step, so a busy machine slowed them more than
+  their formula says. In the demo, under load, `fast-ok` (speedup 1.3) measured 0.84× the reference
+  and `spec-fake` (speedup 1.1) measured 1.12×, so the recommendation changed to `spec-fake`.
+- **Decision:** The server does not sleep. Every streamed content chunk carries `day0_virtual_ns`,
+  its simulated time in whole nanoseconds from the start of the request: the time to first token,
+  then one step per further token. `virtual_timing` computes them with the §13.3 formulas. The
+  concurrency comes from the `x-day0-concurrency` header, and it takes the place of `active` in the
+  formulas. The live request count is still exported as the `vllm:num_requests_running` gauge, but it
+  no longer feeds the timing. The perf runner times the fake server on this virtual clock.
+  `_simulate_queue` sends one request at a time, and gives each to the worker that is free first on
+  the simulated timeline. Measurement starts when the warmup has finished. Every other backend is
+  still timed with the wall clock. `perf.json` records the clock, and the card states it.
+- **Consequence:** The demo gives the same numbers on every run and on any machine. Two runs in
+  parallel on this 4-vCPU sandbox produced byte-identical `perf.json` files. The throughput ratio of
+  each candidate equals its `speedup` exactly, because every simulated latency is divided by the same
+  factor, so `fast-ok` is recommended by construction and not by a margin that depends on the machine.
+  The spec asks for `asyncio.sleep` in §13.3. That is a deviation, and this entry records it. The
+  fake's numbers describe its formulas, not a machine, and the card and `docs/metrics.md` say so.

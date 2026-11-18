@@ -116,7 +116,9 @@ The fake server (`day0/fake/`) lets every layer run without a GPU:
   logprobs, prompt logprobs, SSE with continuous usage), and Prometheus metrics with optional
   speculative-decoding counters.
 - Latency simulation: time to first token and time per token grow with prompt length and with the
-  number of active requests, and are divided by `speedup`.
+  concurrency a request is served at, and are divided by `speedup`. The server never waits. Each
+  content chunk carries its simulated time, and the perf runner times the fake on that virtual clock
+  (D-39).
 
 Its outcomes are calibrated so that §18.1 holds. They are a test fixture. They say nothing about
 real models or hardware.

@@ -24,8 +24,9 @@ make fake-demo      # runs examples/fake.yaml and prints the card path
 ```
 
 `make fake-demo` writes `results/fake-demo-<timestamp>/`, with `card.md`, `card.json`, and
-`pareto.png`. The fake server simulates latency with a formula. Its outcomes are fixed by
-construction to test the pipeline, so they are not evidence about any real model.
+`pareto.png`. The fake server simulates latency with a formula on a virtual clock, so its numbers are
+the same on every machine. Its outcomes are fixed by construction to test the pipeline, so they are
+not evidence about any real model.
 
 Rebuild a card from its artifacts at any time:
 
