@@ -99,3 +99,37 @@ Format: context, decision, consequence.
   Prometheus lines are skipped. Missing `usage` or `choices` is an error, not a partial result.
 - **Consequence:** Fixture-based tests under `tests/fixtures/vllm/` skip until real captures are
   committed.
+
+## D-12: The fake backend passes `common_args`
+
+- **Context:** §7.3 gives the fake launch command without `backend.common_args`, but
+  `examples/fake.yaml` sets `common_args: ["--startup-delay-s", "0.5"]`.
+- **Decision:** The fake command is `[python, -m, day0.fake.server, --host, …, --port, …,
+  *common_args, *server.args]`.
+- **Consequence:** The shared startup delay in the example takes effect.
+
+## D-13: `--logprobs-mode raw_logprobs` is added when absent
+
+- **Context:** §2.3 says day0 always passes `--logprobs-mode raw_logprobs` explicitly, but the
+  command in §7.2 does not include it.
+- **Decision:** The flag is appended to the vLLM command unless `common_args` or the server's `args`
+  already set `--logprobs-mode`, in which case the user's value is used unchanged.
+- **Consequence:** Quality metrics always see raw logprobs, and an explicit override is still
+  possible.
+
+## D-14: Backend structure
+
+- **Context:** The specification gives `get_backend(kind, cfg)` without the run-level values that
+  `vllm serve` needs (model id, length limit, seed, logprob limit).
+- **Decision:** `get_backend(kind, cfg, context)` takes a `BackendContext`. The shared
+  launch-and-wait logic lives in `ProcessBackend` in `backends/base.py`.
+- **Consequence:** `backends/base.py` holds more than the ABC. There are no other new modules.
+
+## D-15: Stopping a server
+
+- **Context:** §7.2 requires SIGTERM to the process group, a 60 s grace period, SIGKILL, a cooldown,
+  and a GPU-memory wait.
+- **Decision:** Implemented as written. The GPU wait runs only when `nvidia-smi` is on `PATH`, and
+  on timeout it logs a warning rather than failing the run. A server that does not become healthy
+  is stopped before `BackendStartError` is raised.
+- **Consequence:** No orphan keeps GPU memory after a failed start.
