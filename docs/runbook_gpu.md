@@ -95,7 +95,9 @@ make test
 DAY0_GPU_TESTS=1 pytest -q -rs tests/gpu
 ```
 
-Expect 6 passed. `-rs` prints the reason for any skip. The parser tests load these captures when
+Expect 6 passed for the GPU tests. `-rs` prints the reason for any skip. If `make test` fails only on
+the recommendation of its end-to-end test, the machine was busy. Rerun it on an idle machine
+(`docs/decisions.md`, D-38). The parser tests load these captures when
 they are present, and they skip when they are absent. A failure in the fixture test means the
 captured file does not parse the way the tests assume. Keep the output and record it in
 `docs/decisions.md`, together with what the smoke test showed: the flags accepted, the logprobs

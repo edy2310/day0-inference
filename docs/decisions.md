@@ -355,3 +355,19 @@ Format: context, decision, consequence.
   once fixtures are copied. Without fixtures that test is skipped. The GPU tests find `vllm` on
   `PATH`, so activate `.venv` first. Without it the tests are skipped, not failed, and `pytest -rs`
   shows the reason.
+
+## D-38: The end-to-end recommendation depends on machine load
+
+- **Context:** `tests/integration/test_end_to_end_fake.py` expects `recommendation: fast-ok`. The
+  recommendation is the passing candidate with the highest target throughput (`day0/gate.py`,
+  `recommend`). The fake server's throughput is measured on the wall clock, so it depends on how much
+  CPU is free. In one run, while other CPU-heavy work ran on the same 4-vCPU sandbox, every candidate
+  kept its expected status, but the recommendation was `spec-fake` (1.12× throughput) instead of
+  `fast-ok` (0.84×). The same test at `HEAD` on an idle machine passed, and the full suite passed on
+  the committed tree (183 passed).
+- **Decision:** The test is unchanged. Run the suite on an otherwise idle machine. If only the
+  recommendation assertion fails, check the card: its statuses are the stronger check, and they
+  matched in the failing run.
+- **Consequence:** Under load, `make test` can fail on that one line without any code change.
+  Making the fake server's timing independent of the machine would remove this. That is a change to
+  the fake model's timing, so it is not made here.
