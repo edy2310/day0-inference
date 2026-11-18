@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "day0"
+version = "0.1.0"
+description = "Find the fastest LLM serving configuration that is still quality-equivalent to the reference."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+keywords = ["llm", "vllm", "inference", "benchmark", "quantization", "kl-divergence"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: Apache Software License",
+  "Typing :: Typed",
+]
+dependencies = [
+  "typer>=0.12",
+  "httpx>=0.27",
+  "pydantic>=2.6",
+  "pyyaml>=6.0",
+  "numpy>=1.26",
+  "matplotlib>=3.8",
+  "rich>=13.7",
+  "starlette>=0.37",
+  "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+# Only used by scripts/build_suites.py when building suites from public datasets.
+suites = ["datasets>=2.19"]
+# Only used by scripts/validate_kl.py (offline KL estimator validation, not part of the package).
+validate = ["torch>=2.2", "transformers>=4.40"]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "types-PyYAML>=6.0",
+]
+
+[project.scripts]
+day0 = "day0.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["day0"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["day0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["gpu: needs a GPU and a real vLLM install; runs only when DAY0_GPU_TESTS=1"]
