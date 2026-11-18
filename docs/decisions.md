@@ -162,3 +162,26 @@ Format: context, decision, consequence.
   because its top-k distributions are the baseline. Exact match then compares text when token ids
   are not returned.
 - **Consequence:** A reference that cannot return top-k fails the run with exit code 2.
+
+## D-19: Perf requests are identical across configurations
+
+- **Context:** §11.1 says the perf prompts are tokenized once on the reference and reused, so every
+  configuration does identical work.
+- **Decision:** `build_workload` seeds one generator per concurrency level from
+  `derive_seed(seed, "perf", level)`. The shared prefix uses its own seed. Warmup requests come
+  first inside each level. The stored workload is loaded by every candidate and never rebuilt.
+- **Consequence:** Adding or removing a level does not change the prompts of the other levels.
+
+## D-20: Goodput and SLO on requests without TPOT
+
+- **Context:** A request with one output token has no TPOT (§11.3).
+- **Decision:** Such a request counts as meeting the TPOT bound for goodput. The SLO check at
+  level granularity uses the p99 TPOT of requests that have one, and is `False` when none do.
+- **Consequence:** A workload with one-token outputs cannot meet the SLO by accident.
+
+## D-21: Environment capture stores a host hash only
+
+- **Context:** The specification asks for a hostname hash in `env.json`, not the raw name.
+- **Decision:** `hostname_hash` is the first twelve hex characters of SHA-256 of the host name.
+  The git commit is stored in `run.json`, not in `env.json`.
+- **Consequence:** `env.json` does not reveal the machine name, and each field is best effort.
