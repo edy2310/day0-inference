@@ -133,3 +133,32 @@ Format: context, decision, consequence.
   on timeout it logs a warning rather than failing the run. A server that does not become healthy
   is stopped before `BackendStartError` is raised.
 - **Consequence:** No orphan keeps GPU memory after a failed start.
+
+## D-16: "Paired" bootstrap means resampling items
+
+- **Context:** §12.3 asks for a paired percentile bootstrap of per-item means. Each candidate is
+  compared with the reference through a per-item metric, not through two independent samples.
+- **Decision:** The bootstrap resamples per-prompt values with replacement. The unit is always the
+  prompt, never a position or a token. Seeds are derived from `run.seed`, the config name, the
+  metric, and the slice.
+- **Consequence:** Intervals reflect prompt-to-prompt variability. Within-prompt correlation does
+  not inflate the sample size.
+
+## D-17: Missing data per metric and per slice
+
+- **Context:** Prompts longer than `prefill_max_prompt_tokens` skip the teacher-forced path. A
+  slice can therefore contain items with no prefill data at all.
+- **Decision:** For each gated metric, a slice is judged only on the items that have data for
+  that metric. A slice with zero such items is "not covered" for that metric. A slice with at
+  least one but fewer than `min_prompts_per_slice` such items is `INSUFFICIENT_DATA`.
+- **Consequence:** The flip rate is always judged on every gold item in a slice. Prefill metrics
+  are judged only where they exist, and the card states the coverage.
+
+## D-18: Generation logprobs fallback applies only to candidates
+
+- **Context:** §10.2 allows a single retry without logprobs when a server rejects them, and marks
+  `generation_logprobs_available = false`.
+- **Decision:** The fallback applies only to candidate runs. The reference never falls back,
+  because its top-k distributions are the baseline. Exact match then compares text when token ids
+  are not returned.
+- **Consequence:** A reference that cannot return top-k fails the run with exit code 2.
