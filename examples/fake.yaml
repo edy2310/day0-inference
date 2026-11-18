@@ -1,0 +1,50 @@
+# Fake-server demo. Exercises the whole pipeline without a GPU.
+# Run it with:  day0 run examples/fake.yaml   (or: make fake-demo)
+# The fake server ships with day0 (see day0/fake/). Its parameters are calibrated so that each
+# candidate has a known outcome (docs/decisions.md, and tests/integration/test_end_to_end_fake.py).
+schema_version: 1
+run: {name: fake-demo, seed: 1234, output_dir: ../results}
+model: {id: fake-model, max_model_len: 65536}
+hardware: {num_gpus: 1, gpu_hour_usd: 3.0, label: fake}
+backend:
+  kind: fake
+  port: 8199
+  startup_timeout_s: 60
+  cooldown_s: 0
+  common_args: ["--startup-delay-s", "0.5"]
+reference:
+  name: ref
+  args: []
+candidates:
+  # Identical behavior to the reference: should PASS with about zero KL and no flips.
+  - {name: identical,   args: ["--noise", "0.0", "--speedup", "1.0"]}
+  # Small logit noise and a modest speedup: should PASS and be recommended.
+  - {name: fast-ok,     args: ["--noise", "0.02", "--speedup", "1.3"]}
+  # Large noise plus a 20% flip probability: should FAIL_QUALITY.
+  - {name: fast-noisy,  args: ["--noise", "0.8", "--flip-prob", "0.2", "--speedup", "1.6"]}
+  # Noise only grows with absolute position past 2048 tokens: should FAIL_QUALITY in the long slice.
+  - {name: longctx-bad, args: ["--noise", "0.01", "--long-ctx-start", "2048", "--long-ctx-factor", "40", "--flip-prob", "0.0", "--speedup", "1.2"]}
+  # Slower than the SLO allows: quality PASSes, latency fails (FAIL_SLO).
+  - {name: slow,        args: ["--speedup", "0.3"]}
+  # Exposes speculative-decoding counters on /metrics: should PASS with an acceptance summary.
+  - {name: spec-fake,   args: ["--spec-accept-rate", "0.6", "--speedup", "1.1"]}
+quality:
+  top_k_logprobs: 20
+  concurrency: 16
+  prefill_concurrency: 8
+  prefill_max_prompt_tokens: 16384
+  suites:
+    - {path: fake_suites/echo_mixed.jsonl, max_tokens: 48}
+  slices: [0, 512, 2048, 65536]
+  noise_floor: {enabled: true, num_prompts: 20, concurrency_a: 1, concurrency_b: 8}
+  determinism: {enabled: true, num_prompts: 20, concurrency_low: 1, concurrency_high: 8}
+budget: {flip_rate_max: 0.10, kl_mean_max: 0.01, top1_agreement_min: 0.95, min_prompts_per_slice: 30, confidence: 0.95, bootstrap_resamples: 500}
+perf:
+  warmup_requests: 4
+  concurrency_levels: [1, 8, 16]
+  target_concurrency: 8
+  requests_per_level: 32
+  input_len: {dist: uniform, min: 64, max: 512}
+  output_len: 32
+  shared_prefix_len: 0
+slo: {ttft_p99_ms: 120, tpot_p99_ms: 6}

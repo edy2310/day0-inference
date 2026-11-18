@@ -1,0 +1,70 @@
+# Real GPU run: Llama-3.1-8B-Instruct on one H100 80GB.
+# Read docs/runbook_gpu.md first. Every value marked "starting point" must be fixed BEFORE the run
+# (the config hash is recorded in the card to show that thresholds were not tuned afterwards).
+#
+# Every raw vLLM flag below must be verified against the pinned vLLM version:
+#   day0 validate examples/llama31-8b-h100.yaml --check-flags
+schema_version: 1
+run: {name: llama31-8b-h100, seed: 1234, output_dir: ../results}
+model: {id: meta-llama/Llama-3.1-8B-Instruct, max_model_len: 40960}
+hardware: {num_gpus: 1, gpu_hour_usd: 3.00, label: "1x H100 80GB"}  # starting point: fix the real price
+backend:
+  kind: vllm
+  executable: vllm
+  port: 8100
+  startup_timeout_s: 1500
+  cooldown_s: 15
+  common_args: ["--gpu-memory-utilization", "0.90", "--logprobs-mode", "raw_logprobs", "--dtype", "bfloat16"]
+reference:
+  name: bf16
+  description: BF16 weights and KV cache, vLLM defaults
+  args: []
+candidates:
+  # Weight-only FP8 quantization.
+  - name: fp8-weights
+    args: ["--quantization", "fp8"]
+  # FP8 KV cache with BF16 weights.
+  - name: fp8-kv
+    args: ["--kv-cache-dtype", "fp8"]
+  # Both FP8 weights and FP8 KV cache.
+  - name: fp8-weights-kv
+    args: ["--quantization", "fp8", "--kv-cache-dtype", "fp8"]
+  # Smaller chunked-prefill budget: changes batching, not numerics; isolates scheduling effects.
+  - name: mnbt-2048
+    args: ["--max-num-batched-tokens", "2048"]
+  # Larger chunked-prefill budget.
+  - name: mnbt-8192
+    args: ["--max-num-batched-tokens", "8192"]
+  # Prefix caching disabled: measures how much the shared prefix in perf prompts helps.
+  - name: no-prefix-cache
+    args: ["--no-enable-prefix-caching"]
+  # Prompt-lookup speculative decoding (no draft model needed).
+  - name: spec-ngram
+    args: ["--speculative-config", '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_min": 2, "prompt_lookup_max": 5}']
+  # Stretch goal: needs an EAGLE head that matches the pinned vLLM version, so it is disabled.
+  - name: spec-eagle
+    enabled: false
+    description: Stretch goal; requires an EAGLE head compatible with the pinned vLLM version
+    args: ["--speculative-config", '{"method": "eagle", "model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B", "num_speculative_tokens": 3}']
+quality:
+  top_k_logprobs: 20
+  concurrency: 16
+  prefill_concurrency: 4
+  prefill_max_prompt_tokens: 8192
+  suites:
+    - {path: ../suites/gsm8k_200.jsonl, max_tokens: 512}
+    - {path: ../suites/longctx_synth.jsonl, max_tokens: 32}
+    - {path: ../suites/chat_open_100.jsonl, max_tokens: 256}
+  slices: [0, 2048, 8192, 40960]
+  noise_floor: {enabled: true, num_prompts: 50, concurrency_a: 1, concurrency_b: 32}
+  determinism: {enabled: true, num_prompts: 50, concurrency_low: 1, concurrency_high: 64}
+budget: {flip_rate_max: 0.05, kl_mean_max: 0.01, top1_agreement_min: 0.95, min_prompts_per_slice: 30, confidence: 0.95, bootstrap_resamples: 2000}  # starting point
+perf:
+  warmup_requests: 20
+  concurrency_levels: [1, 8, 32, 64]
+  target_concurrency: 32
+  requests_per_level: 256
+  input_len: {dist: uniform, min: 512, max: 2048}
+  output_len: 256
+  shared_prefix_len: 1024
+slo: {ttft_p99_ms: 500, tpot_p99_ms: 50}  # starting point: fix the product SLO before the run

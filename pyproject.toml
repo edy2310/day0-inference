@@ -59,6 +59,11 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 strict = true
 python_version = "3.11"
 files = ["day0"]
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_typed = true
+init_forbid_extra = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
