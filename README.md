@@ -9,10 +9,6 @@ Find the fastest LLM serving configuration that is still quality-equivalent to t
 <!-- RESULTS: copy the recommendation box from results/published/llama31-8b-h100/card.md once a
 real run is published. Nothing in this section is a measurement yet. -->
 
-| Configuration | Status | Throughput × reference | p99 TTFT (ms) | p99 TPOT (ms) | Flip rate [CI] | Prefill KL [CI] |
-|---|---|---|---|---|---|---|
-| _to be filled after a real run_ | | | | | | |
-
 ## Quickstart with the fake server (no GPU)
 
 Requires Python 3.11 or 3.12.
