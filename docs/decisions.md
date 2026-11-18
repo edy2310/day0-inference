@@ -37,6 +37,7 @@ Format: context, decision, consequence.
   (`--gsm8k-jsonl`) and does not download it. No GSM8K items are invented or substituted.
 - **Consequence:** `examples/llama31-8b-h100.yaml` fails `day0 validate` until the file is built.
   The real-run example is validated in tests with placeholder files in a temporary directory.
+- **Later:** Superseded in part by D-35. The offline `--gsm8k-jsonl` path still works.
 
 ## D-05: Shared filler-text module
 
@@ -270,7 +271,8 @@ Format: context, decision, consequence.
 - **Context:** §9.4 asks for three committed suites, with deterministic builds.
 - **Decision:** `scripts/build_suites.py` builds `longctx_synth.jsonl` (100 items, about 5 MB) and
   `chat_open_100.jsonl` (100 original prompts, stored in the script). It builds
-  `gsm8k_200.jsonl` only when given the official file with `--gsm8k-jsonl` (see D-04). Two builds
+  `gsm8k_200.jsonl` only when given a source, `--gsm8k-from-hub` or `--gsm8k-jsonl` (see D-04 and
+  D-35). Two builds
   produce byte-identical files, which was checked.
 - **Consequence:** The suites are reproducible, and the 5 MB file is the largest committed artifact.
 
@@ -278,8 +280,8 @@ Format: context, decision, consequence.
 
 - **Context:** §16 asks for `scripts/validate_kl.py` and `docs/kl_validation.md`. The script needs
   `torch` and `transformers`, and downloads the model from Hugging Face, which is blocked here.
-- **Decision:** The script is written as specified and is not run. `docs/kl_validation.md` is a
-  placeholder that says so.
+- **Decision:** The script is written as specified. `docs/kl_validation.md` stays a placeholder.
+- **Later:** D-36 ran the script once, on a tiny random model, and fixed the bug that run found.
 - **Consequence:** Nothing in the repository claims a measured estimator error.
 
 ## D-33: End-to-end test duration
@@ -292,3 +294,64 @@ Format: context, decision, consequence.
 - **Consequence:** The 90 s target is not met here. To meet it, reduce the long-context bucket of
   the fake suite, or make the fake server return prompt logprobs only for the requested positions
   (a deviation from the vLLM response shape). Either change must be recorded here first.
+
+## D-34: vLLM 0.34.0 is the default, with a driver check
+
+- **Context:** The setup script refused to run without `VLLM_VERSION`, so the operator had to find a
+  version with the flags day0 uses. The 0.34.0 wheel was read to confirm them: `vllm serve` accepts
+  `--logprobs-mode`, `--max-logprobs`, and the prompt-logprob and streaming-usage fields the client
+  parses. The wheel requires torch 2.14.0 with CUDA 13 libraries. NVIDIA's minimum driver for
+  CUDA 13.0 on Linux is 580. That number comes from NVIDIA's documentation and was not measured here.
+- **Decision:** `scripts/gpu_setup.sh` defaults to `VLLM_VERSION=0.34.0` and accepts any other
+  version. It checks the driver before it installs anything, and a major version below 580 stops the
+  script. `DAY0_SKIP_DRIVER_CHECK=1` skips that check. After the install, the script checks that
+  `vllm serve --help=all` lists four flags day0 passes: `--logprobs-mode`, `--max-logprobs`,
+  `--seed`, and `--max-model-len`.
+- **Consequence:** A host with an older driver fails early, with a message. The version has not yet
+  run on a GPU. The GPU smoke test in `tests/gpu` is the first real check.
+
+## D-35: GSM8K can come from the Hugging Face hub
+
+- **Context:** D-04 kept the suite builder offline, because the build environment cannot reach
+  Hugging Face. The specification's `[suites]` extra lists `datasets`, which is the intended way to
+  get the split. A RunPod host can reach the hub.
+- **Decision:** `scripts/build_suites.py --gsm8k-from-hub` loads `openai/gsm8k`, config `main`, split
+  `test`, through `datasets`, and then samples the same 200 items as the JSONL path.
+  `scripts/gpu_setup.sh` installs `datasets` through the `suites` extra. The offline `--gsm8k-jsonl`
+  path is unchanged. The hub path was not run here, because the hub is blocked. Its only difference
+  from the JSONL path is the reader, which returns the same rows.
+- **Consequence:** The hub's split is not pinned to a revision, because the revision could not be
+  checked here. The sha256 of `suites/gsm8k_200.jsonl` is recorded with each published run, so a
+  changed split shows up as a different file.
+
+## D-36: `validate_kl.py` fixed after its first run
+
+- **Context:** D-32 left the script unrun. transformers 5.22.2 returns a dictionary from
+  `apply_chat_template` by default (`return_dict=True`). The old `_prompt_ids` would have failed on
+  the first prompt with `ValueError: invalid literal for int() with base 10: 'input_ids'`. A tiny
+  random model, built in a scratch directory and not committed, reproduced that error with the old
+  script. The new script ran all 50 prompts on it, on CPU.
+- **Decision:** `return_dict=False` is passed explicitly. Models load with `dtype=`, because
+  `torch_dtype` is deprecated in transformers 5. The script uses CUDA when it is visible, and
+  `--device` overrides that. Noise is drawn on the CPU, so the same seed gives the same weights on
+  any device. The top-k order comes from a partial selection, and the exact KL is computed once per
+  position, not once per k. Greedy decoding sets `repetition_penalty=1.0`, so the model's generation
+  config does not change the sequence. The report states the device and how many prompts produced
+  tokens. `tests/unit/test_validate_kl.py` covers the pure helpers and the chat-template call.
+- **Consequence:** The `validate` extra requires transformers 5 and torch 2.6 or newer. The default
+  model is 0.5B. The script holds three copies of the model at once, and three copies of an 8B model
+  need about 80 GB for the weights alone, which does not fit one 80 GB GPU. The numbers from the tiny
+  model are not results and are not written to the repository. `docs/kl_validation.md` stays a
+  placeholder until the default model runs on the GPU.
+
+## D-37: The smoke test's fixture and the client's lifetime
+
+- **Context:** The GPU smoke test ran the server fixture in one event loop and each test's client in
+  another, so the second test failed with `Event loop is closed`. The failure was reproduced against
+  a stand-in server.
+- **Decision:** The module fixture starts and stops the server, and nothing else. Each test creates
+  its own `InferenceClient` inside its own `asyncio.run`, and closes it before the loop ends.
+- **Consequence:** On a GPU host the five protocol tests run, and the fixture-consistency test runs
+  once fixtures are copied. Without fixtures that test is skipped. The GPU tests find `vllm` on
+  `PATH`, so activate `.venv` first. Without it the tests are skipped, not failed, and `pytest -rs`
+  shows the reason.

@@ -8,7 +8,8 @@ result.
 - **The top-k KL is an approximation.** It sees the top-k of each distribution and merges the rest
   into a tail bucket. It is a lower bound with exact probabilities, but imputation for missing
   tokens can move it either way. The size of the error is measured by `scripts/validate_kl.py` and
-  reported in [`kl_validation.md`](kl_validation.md). That validation has not been run yet.
+  reported in [`kl_validation.md`](kl_validation.md). That document has no measured numbers yet: the
+  script has run only on a tiny random model, to check its code path (see `decisions.md`, D-36).
 - **The prefill path does not exercise speculative decoding.** Teacher-forced scoring runs a
   prefill, so a speculative-decoding candidate is only compared on its generation path there.
 - **vLLM ignores the prefix cache for prompt-logprob requests.** Prefill numbers therefore do not
@@ -29,8 +30,9 @@ result.
 ## Data
 
 - **Dataset licences.** `gsm8k_200.jsonl` is sampled from the GSM8K test split (MIT licence). It is
-  built from a file the user provides with `--gsm8k-jsonl`, and it is not committed by this
-  repository's build (see [`runbook_gpu.md`](runbook_gpu.md)). `chat_open_100.jsonl` was written for
+  built with `--gsm8k-from-hub` (no pinned revision, see `decisions.md`, D-35) or from a local copy
+  with `--gsm8k-jsonl`. The repository has no GSM8K items until someone builds and commits the file
+  (see [`runbook_gpu.md`](runbook_gpu.md)). `chat_open_100.jsonl` was written for
   this project, and no text was copied from another dataset or website.
 - **The long-context suite is synthetic.** `longctx_synth.jsonl` uses filler text from a built-in
   word list with embedded facts. It measures retrieval and summation over that filler. It is not
