@@ -21,6 +21,12 @@ from day0.parsing import TopK, aiter_sse_payloads, parse_completion, parse_prome
 
 ERROR_BODY_CHARS = 500
 _COMPLETIONS_PATH = "/v1/completions"
+# Request header with the closed-loop concurrency the request is served at. Only the fake server
+# reads it, because its simulated latency depends on how many requests share the server (D-39).
+CONCURRENCY_HEADER = "x-day0-concurrency"
+# Field of each content chunk with the simulated time of that chunk, in nanoseconds since the
+# request was sent. Only the fake server sends it (D-39).
+VIRTUAL_NS_FIELD = "day0_virtual_ns"
 # Connection-level failures before a response: a keep-alive connection the server closed, or a
 # reset. Retrying them is safe because every request is deterministic (greedy, seeded).
 _RETRYABLE = (httpx.ReadError, httpx.RemoteProtocolError, httpx.WriteError)
@@ -69,6 +75,8 @@ class StreamResult:
         end_ns: Time the stream ended, from ``perf_counter_ns``.
         chunk_counts_exact: False when chunks carried no cumulative usage, so each chunk was
             counted as one token.
+        virtual_ns: Simulated time of each content chunk in nanoseconds since the request was
+            sent, when the server reports one (the fake server). ``None`` otherwise.
     """
 
     ok: bool
@@ -80,6 +88,7 @@ class StreamResult:
     output_tokens: int
     end_ns: int
     chunk_counts_exact: bool
+    virtual_ns: list[int] | None = None
 
 
 class _FixtureRecorder:
@@ -429,6 +438,7 @@ class InferenceClient:
         max_tokens: int,
         seed: int,
         ignore_eos: bool = True,
+        concurrency: int | None = None,
     ) -> StreamResult:
         """Run one streamed completion and record chunk timings.
 
@@ -440,6 +450,8 @@ class InferenceClient:
             max_tokens: Output budget.
             seed: Request seed.
             ignore_eos: Whether generation continues past EOS.
+            concurrency: Closed-loop concurrency the request is served at, sent in
+                ``CONCURRENCY_HEADER``. ``None`` sends no header.
 
         Returns:
             The timings and token counts.
@@ -456,9 +468,12 @@ class InferenceClient:
             "stream_options": {"include_usage": True, "continuous_usage_stats": True},
             "ignore_eos": ignore_eos,
         }
+        headers = None if concurrency is None else {CONCURRENCY_HEADER: str(concurrency)}
         start_ns = time.perf_counter_ns()
         try:
-            async with self._http.stream("POST", _COMPLETIONS_PATH, json=body) as response:
+            async with self._http.stream(
+                "POST", _COMPLETIONS_PATH, json=body, headers=headers
+            ) as response:
                 if response.status_code >= 400:
                     text = (await response.aread()).decode("utf-8", errors="replace")
                     error = f"HTTP {response.status_code}: {text[:ERROR_BODY_CHARS]}"
@@ -482,6 +497,8 @@ class InferenceClient:
         """
         chunk_ns: list[int] = []
         chunk_tokens: list[int] = []
+        virtual: list[int] = []
+        virtual_complete = True
         first_ns: int | None = None
         previous_cumulative = 0
         exact = True
@@ -502,6 +519,11 @@ class InferenceClient:
                 if first_ns is None:
                     first_ns = now
                 chunk_ns.append(now)
+                reported = chunk.get(VIRTUAL_NS_FIELD)
+                if isinstance(reported, int) and not isinstance(reported, bool):
+                    virtual.append(reported)
+                else:
+                    virtual_complete = False
                 if isinstance(usage, Mapping):
                     cumulative = int(usage["completion_tokens"])
                     chunk_tokens.append(max(1, cumulative - previous_cumulative))
@@ -510,6 +532,7 @@ class InferenceClient:
                     exact = False
                     chunk_tokens.append(1)
         end_ns = time.perf_counter_ns()
+        virtual_ns = virtual if virtual_complete and virtual else None
 
         if final_usage is not None:
             output_tokens = int(final_usage["completion_tokens"])
@@ -525,6 +548,7 @@ class InferenceClient:
                     output_tokens=output_tokens,
                     end_ns=end_ns,
                     chunk_counts_exact=exact,
+                    virtual_ns=virtual_ns,
                 )
         else:
             output_tokens = sum(chunk_tokens)
@@ -538,6 +562,7 @@ class InferenceClient:
             output_tokens=output_tokens,
             end_ns=end_ns,
             chunk_counts_exact=exact,
+            virtual_ns=virtual_ns,
         )
 
     async def metrics_text(self) -> str | None:

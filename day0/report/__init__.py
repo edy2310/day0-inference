@@ -33,6 +33,7 @@ from day0.gate import (
     pareto_front,
     recommend,
 )
+from day0.perf.metrics import timing_clock
 from day0.quality.metrics import ReferenceRecord, topk_kl
 from day0.report.card import render_card
 from day0.report.pareto import render_pareto
@@ -363,6 +364,7 @@ def build_report(art: RunArtifacts) -> dict[str, Any]:
             "num_gpus": hardware.num_gpus,
             "gpu_hour_usd": hardware.gpu_hour_usd,
             "backend_kind": cfg.backend.kind,
+            "timing_clock": timing_clock(cfg.backend.kind),
             "seed": cfg.run.seed,
         },
         "budget": cfg.budget.model_dump(mode="json"),

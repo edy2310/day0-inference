@@ -77,10 +77,14 @@ async def test_perf_sweep_with_fake_server(examples_dir: Path, tmp_path: Path) -
         reloaded = requests_from_rows(workload_rows(built))
         assert len(reloaded) == len(built)
         sweep = await run_sweep(client, reloaded, cfg, seed=cfg.run.seed)
+        # The fake server is timed on its virtual clock, so a second sweep must reproduce the first.
+        again = await run_sweep(client, reloaded, cfg, seed=cfg.run.seed)
     finally:
         await client.aclose()
         await backend.stop(handle)
 
+    assert sweep.clock == "virtual"
+    assert again.levels == sweep.levels
     assert [level["concurrency"] for level in sweep.levels] == [1, 4]
     for level in sweep.levels:
         assert level["n_ok"] == 6

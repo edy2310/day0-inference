@@ -2,6 +2,10 @@
 
 Run it directly with ``python -m day0.fake.server --port 8199``. The request and response shapes
 follow §13.3 of the specification, so the same client and parsers work against both servers.
+
+Latencies are simulated on a virtual clock. The server never waits. Each streamed content chunk
+carries its simulated time, so a run gives the same numbers on any machine
+(docs/decisions.md, D-39).
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from day0.client import CONCURRENCY_HEADER, VIRTUAL_NS_FIELD
 from day0.fake.model import (
     EOS_ID,
     TOKEN_TEXT,
@@ -45,7 +50,7 @@ from day0.fake.model import (
 _PROMPT_CHUNK = 4096
 
 FAKE_VERSION = "fake-0.1"
-_MILLISECONDS = 1000.0
+_NS_PER_MS = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -90,34 +95,6 @@ class _ServerState:
     spec_draft_tokens: int = 0
     spec_accepted: int = 0
 
-    def slowdown(self) -> float:
-        """Return the latency multiplier for the current number of active requests.
-
-        Returns:
-            ``(1 + penalty * active) / speedup``.
-        """
-        return (1.0 + self.config.concurrency_penalty * self.active) / self.config.speedup
-
-    def ttft_seconds(self, prompt_len: int) -> float:
-        """Simulated time to first token.
-
-        Args:
-            prompt_len: Prompt length in tokens.
-
-        Returns:
-            Seconds to wait before the first output token.
-        """
-        base = self.config.ttft_base_ms + self.config.prefill_ms_per_1k * prompt_len / 1000.0
-        return base * self.slowdown() / _MILLISECONDS
-
-    def itl_seconds(self) -> float:
-        """Simulated time between two output tokens.
-
-        Returns:
-            Seconds to wait before each subsequent output token.
-        """
-        return self.config.itl_base_ms * self.slowdown() / _MILLISECONDS
-
     def record_spec(self, generated: int) -> None:
         """Update the speculative-decoding counters for one finished generation.
 
@@ -132,6 +109,48 @@ class _ServerState:
         self.spec_drafts += steps
         self.spec_draft_tokens += draft_len * steps
         self.spec_accepted += int(round(rate * draft_len * steps))
+
+
+def virtual_timing(config: FakeServerConfig, prompt_len: int, active: int) -> tuple[int, int]:
+    """Simulated time to first token and between output tokens, in whole nanoseconds.
+
+    The formulas are those of §13.3, with ``active`` as the concurrency the request is served at.
+    Whole nanoseconds keep the timeline exact, and the arithmetic has no dependence on the clock.
+
+    Args:
+        config: Server settings.
+        prompt_len: Prompt length in tokens.
+        active: Concurrency the request is served at.
+
+    Returns:
+        ``(time to first token, time between output tokens)`` in nanoseconds.
+    """
+    slowdown = (1.0 + config.concurrency_penalty * active) / config.speedup
+    base_ms = config.ttft_base_ms + config.prefill_ms_per_1k * prompt_len / 1000.0
+    ttft_ns = round(base_ms * slowdown * _NS_PER_MS)
+    itl_ns = round(config.itl_base_ms * slowdown * _NS_PER_MS)
+    return ttft_ns, itl_ns
+
+
+def _declared_concurrency(request: Request) -> int | Response:
+    """Read the concurrency a request is served at from its header.
+
+    Args:
+        request: Incoming request.
+
+    Returns:
+        The concurrency (1 when the header is absent), or a 400 response when it is malformed.
+    """
+    raw = request.headers.get(CONCURRENCY_HEADER)
+    if raw is None:
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        return _error(400, f"{CONCURRENCY_HEADER} must be a positive integer")
+    return value
 
 
 class _Decoder:
@@ -577,13 +596,16 @@ def create_app(config: FakeServerConfig) -> Starlette:
         logprobs_k = body.get("logprobs")
         prompt_k = body.get("prompt_logprobs")
         plan = plan_turn(ids, params)
+        concurrency = _declared_concurrency(request)
+        if isinstance(concurrency, Response):
+            return concurrency
 
         if bool(body.get("stream", False)):
             options = body.get("stream_options") or {}
             continuous = bool(options.get("continuous_usage_stats", False))
             include_usage = bool(options.get("include_usage", False))
             return StreamingResponse(
-                _stream(ids, plan, max_tokens, ignore_eos, continuous, include_usage),
+                _stream(ids, plan, max_tokens, ignore_eos, continuous, include_usage, concurrency),
                 media_type="text/event-stream",
             )
 
@@ -597,13 +619,8 @@ def create_app(config: FakeServerConfig) -> Starlette:
                 ignore_eos=ignore_eos,
                 logprobs=logprobs_k,
             )
-            first = True
-            while True:
-                token = decoder.step()
-                if token is None:
-                    break
-                await asyncio.sleep(state.ttft_seconds(len(ids)) if first else state.itl_seconds())
-                first = False
+            while decoder.step() is not None:
+                pass
             choice: dict[str, Any] = {
                 "index": 0,
                 "text": decode(decoder.out),
@@ -620,8 +637,6 @@ def create_app(config: FakeServerConfig) -> Starlette:
                     _prompt_logprobs_json, ids, plan, params, prompt_k
                 )
                 choice["prompt_logprobs"] = _PROMPT_SENTINEL
-            if first:
-                await asyncio.sleep(state.ttft_seconds(len(ids)))
             state.record_spec(len(decoder.out))
         finally:
             state.active -= 1
@@ -651,20 +666,20 @@ def create_app(config: FakeServerConfig) -> Starlette:
         ignore_eos: bool,
         continuous: bool,
         include_usage: bool,
+        concurrency: int,
     ) -> AsyncIterator[bytes]:
-        """Yield server-sent events, one token per content chunk."""
+        """Yield server-sent events, one token per content chunk, each with its simulated time."""
         state.active += 1
         decoder = _Decoder(
             ids, plan, params, max_tokens=max_tokens, ignore_eos=ignore_eos, logprobs=None
         )
-        first = True
+        ttft_ns, itl_ns = virtual_timing(config, len(ids), concurrency)
         try:
+            index = 0
             while True:
                 token = decoder.step()
                 if token is None:
                     break
-                await asyncio.sleep(state.ttft_seconds(len(ids)) if first else state.itl_seconds())
-                first = False
                 chunk: dict[str, Any] = {
                     "id": "cmpl-fake",
                     "object": "text_completion",
@@ -679,6 +694,8 @@ def create_app(config: FakeServerConfig) -> Starlette:
                         }
                     ],
                 }
+                chunk[VIRTUAL_NS_FIELD] = ttft_ns + index * itl_ns
+                index += 1
                 if continuous:
                     chunk["usage"] = _usage(ids, len(decoder.out))
                 yield _sse(chunk)

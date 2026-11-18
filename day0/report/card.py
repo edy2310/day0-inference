@@ -440,6 +440,22 @@ def _budget_section(data: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _timing_text(clock: object) -> str:
+    """Describe the clock that timed the requests of a run.
+
+    Args:
+        clock: ``"virtual"`` or ``"wall"``, or ``None`` when the run recorded none.
+
+    Returns:
+        A short description for the card.
+    """
+    if clock == "virtual":
+        return "simulated on the fake server's virtual clock, not measured on hardware"
+    if clock == "wall":
+        return "wall clock (`time.perf_counter_ns`)"
+    return "n/a"
+
+
 def _environment_section(data: Mapping[str, Any]) -> list[str]:
     """Render the environment, timing, and GPU time per configuration.
 
@@ -457,6 +473,7 @@ def _environment_section(data: Mapping[str, Any]) -> list[str]:
         f"- Driver: {gpus[0]['driver_version'] if gpus else 'n/a'}; "
         f"CUDA: {env.get('cuda_version') or 'n/a'}",
         f"- Server: {env.get('server_version') or 'n/a'} (backend {env.get('backend_kind')})",
+        f"- Timing: {_timing_text(run.get('timing_clock'))}",
         f"- day0 {run['day0_version']}; git `{run.get('git_sha') or 'n/a'}`",
         f"- Started {run['started_utc']}; ended {run['ended_utc']}",
     ]

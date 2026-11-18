@@ -296,6 +296,58 @@ def test_startup_delay_answers_503_then_200(start_fake_server: ServerStarter) ->
     assert response.status_code == 200
 
 
+async def test_stream_chunks_carry_the_simulated_timeline(start_fake_server: ServerStarter) -> None:
+    """Each content chunk carries its simulated time: time to first token, then one gap per token.
+
+    Args:
+        start_fake_server: Fixture that starts servers.
+    """
+    base_url = start_fake_server(
+        "--ttft-base-ms",
+        "10",
+        "--prefill-ms-per-1k",
+        "0",
+        "--itl-base-ms",
+        "4",
+        "--concurrency-penalty",
+        "0",
+        "--speedup",
+        "1",
+    )
+    client = _client(base_url)
+    try:
+        prompt = await client.tokenize_text("timed", add_special_tokens=True)
+        result = await client.stream_complete(
+            prompt, max_tokens=5, seed=1, ignore_eos=True, concurrency=1
+        )
+        assert result.ok, result.error
+        assert result.virtual_ns == [10_000_000 + k * 4_000_000 for k in range(5)]
+    finally:
+        await client.aclose()
+
+
+def test_concurrency_header_must_be_a_positive_integer(start_fake_server: ServerStarter) -> None:
+    """A malformed ``x-day0-concurrency`` header is rejected, not replaced by a default.
+
+    Args:
+        start_fake_server: Fixture that starts servers.
+    """
+    base_url = start_fake_server()
+    body = {"model": "fake-model", "prompt": [72, 105], "max_tokens": 2}
+    for value in ("0", "many"):
+        response = httpx.post(
+            f"{base_url}/v1/completions",
+            json=body,
+            headers={"x-day0-concurrency": value},
+            timeout=5.0,
+        )
+        assert response.status_code == 400, value
+    accepted = httpx.post(
+        f"{base_url}/v1/completions", json=body, headers={"x-day0-concurrency": "4"}, timeout=5.0
+    )
+    assert accepted.status_code == 200
+
+
 def test_echo_plan_is_consistent_for_prompt_and_output() -> None:
     """Planning on the prompt alone and on prompt plus output gives the same turn.
 

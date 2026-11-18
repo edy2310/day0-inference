@@ -2,17 +2,21 @@
 
 For each concurrency level, ``C`` worker coroutines pull requests from a shared queue and send them
 one at a time. Warmup requests run first at the same concurrency, and their results are discarded.
+
+On the virtual clock (the fake server), the same workers run as a simulation on the server's
+simulated timeline. See ``_simulate_queue``.
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from day0.client import InferenceClient, StreamResult
 from day0.config import Day0Config
-from day0.perf.metrics import level_summary
+from day0.errors import ServerResponseError
+from day0.perf.metrics import Clock, level_summary, timing_clock
 from day0.perf.workload import PerfRequest
 from day0.scrape import cache_usage, delta, snapshot, spec_decode_summary
 from day0.seeds import derive_seed
@@ -46,12 +50,14 @@ class SweepResult:
         spec_decode: Speculative-decoding summary over the whole sweep, or ``None``.
         cache_usage: Cache gauges after the last level, or an empty dict.
         snapshots: Raw metric snapshots, one entry per level.
+        clock: Clock that timed the requests.
     """
 
     levels: list[dict[str, object]] = field(default_factory=list)
     spec_decode: dict[str, float] | None = None
     cache_usage: dict[str, float] = field(default_factory=dict)
     snapshots: list[dict[str, object]] = field(default_factory=list)
+    clock: Clock = "wall"
 
 
 async def _run_queue(
@@ -91,9 +97,85 @@ async def _run_queue(
                 max_tokens=max_tokens,
                 seed=derive_seed(seed, "perf-request", request.level, request.index, label),
                 ignore_eos=True,
+                concurrency=concurrency,
             )
 
     await asyncio.gather(*(worker() for _ in range(concurrency)))
+    return results
+
+
+def _on_virtual_clock(result: StreamResult, start_ns: int) -> StreamResult:
+    """Move one streamed result onto the simulated timeline of its worker.
+
+    Args:
+        result: The result as the client parsed it.
+        start_ns: Simulated time at which the worker sent the request.
+
+    Returns:
+        The same result, with every timestamp on the simulated timeline.
+
+    Raises:
+        ServerResponseError: A successful request carried no simulated timeline. The virtual clock
+            works only with the fake server.
+    """
+    if not result.ok:
+        return replace(result, start_ns=start_ns, first_token_ns=None, chunk_ns=[], end_ns=start_ns)
+    if result.virtual_ns is None:
+        raise ServerResponseError(
+            "the virtual clock needs a simulated timeline in every content chunk, and this server "
+            "sent none; the virtual clock is for the fake server (backend.kind: fake)"
+        )
+    chunk_ns = [start_ns + offset for offset in result.virtual_ns]
+    return replace(
+        result,
+        start_ns=start_ns,
+        first_token_ns=chunk_ns[0] if chunk_ns else None,
+        chunk_ns=chunk_ns,
+        end_ns=chunk_ns[-1] if chunk_ns else start_ns,
+    )
+
+
+async def _simulate_queue(
+    client: InferenceClient,
+    requests: Sequence[PerfRequest],
+    *,
+    concurrency: int,
+    max_tokens: int,
+    seed: int,
+    free_at_ns: list[int],
+) -> dict[tuple[bool, int], StreamResult]:
+    """Run requests on ``concurrency`` simulated workers, one request at a time.
+
+    Each request goes to the worker that is free first on the simulated timeline (the lowest index
+    on ties), in the order of ``requests``. A closed-loop generator with a shared queue produces
+    this schedule when the server's latencies are known. The requests are sent one after another,
+    because their simulated timeline does not depend on how they overlap in real time.
+
+    Args:
+        client: Server client.
+        requests: Requests to send, in queue order.
+        concurrency: Number of simulated workers.
+        max_tokens: Output length, identical for every request.
+        seed: Run seed.
+        free_at_ns: Simulated time at which each worker is next free. Updated in place.
+
+    Returns:
+        Results keyed by ``(warmup, index)``, with timestamps on the simulated timeline.
+    """
+    results: dict[tuple[bool, int], StreamResult] = {}
+    for request in requests:
+        worker = min(range(concurrency), key=lambda index: (free_at_ns[index], index))
+        label = "warmup" if request.warmup else "measured"
+        raw = await client.stream_complete(
+            request.prompt_ids,
+            max_tokens=max_tokens,
+            seed=derive_seed(seed, "perf-request", request.level, request.index, label),
+            ignore_eos=True,
+            concurrency=concurrency,
+        )
+        placed = _on_virtual_clock(raw, free_at_ns[worker])
+        free_at_ns[worker] = placed.end_ns
+        results[(request.warmup, request.index)] = placed
     return results
 
 
@@ -104,6 +186,7 @@ async def run_level(
     concurrency: int,
     max_tokens: int,
     seed: int,
+    clock: Clock = "wall",
 ) -> LevelRun:
     """Run warmup and measured requests for one concurrency level.
 
@@ -113,6 +196,8 @@ async def run_level(
         concurrency: Closed-loop concurrency.
         max_tokens: Output length.
         seed: Run seed.
+        clock: ``"wall"`` runs the workers concurrently and times them with the wall clock.
+            ``"virtual"`` runs them as a simulation on the server's simulated timeline.
 
     Returns:
         The measured results and the measurement window.
@@ -120,10 +205,31 @@ async def run_level(
     warmup = [r for r in requests if r.warmup]
     measured = [r for r in requests if not r.warmup]
     before = await snapshot(client)
-    await _run_queue(client, warmup, concurrency=concurrency, max_tokens=max_tokens, seed=seed)
-    by_key = await _run_queue(
-        client, measured, concurrency=concurrency, max_tokens=max_tokens, seed=seed
-    )
+    if clock == "virtual":
+        free_at = [0] * concurrency
+        await _simulate_queue(
+            client,
+            warmup,
+            concurrency=concurrency,
+            max_tokens=max_tokens,
+            seed=seed,
+            free_at_ns=free_at,
+        )
+        # Measurement starts once the last warmup request has finished, as in the wall-clock run.
+        free_at = [max(free_at)] * concurrency
+        by_key = await _simulate_queue(
+            client,
+            measured,
+            concurrency=concurrency,
+            max_tokens=max_tokens,
+            seed=seed,
+            free_at_ns=free_at,
+        )
+    else:
+        await _run_queue(client, warmup, concurrency=concurrency, max_tokens=max_tokens, seed=seed)
+        by_key = await _run_queue(
+            client, measured, concurrency=concurrency, max_tokens=max_tokens, seed=seed
+        )
     after = await snapshot(client)
     ordered = [by_key[(False, r.index)] for r in measured]
     if ordered:
@@ -159,7 +265,8 @@ async def run_sweep(
     Returns:
         Level summaries, speculative-decoding summary, and raw snapshots.
     """
-    result = SweepResult()
+    clock = timing_clock(cfg.backend.kind)
+    result = SweepResult(clock=clock)
     deltas: list[dict[str, float]] = []
     last_after: dict[str, float] | None = None
     for level in cfg.perf.concurrency_levels:
@@ -170,6 +277,7 @@ async def run_sweep(
             concurrency=level,
             max_tokens=cfg.perf.output_len,
             seed=seed,
+            clock=clock,
         )
         summary = level_summary(
             concurrency=level,
@@ -240,4 +348,5 @@ def perf_document(sweep: SweepResult, cfg: Day0Config) -> dict[str, object]:
         "cache_usage": sweep.cache_usage,
         "warmup_requests": cfg.perf.warmup_requests,
         "requests_per_level": cfg.perf.requests_per_level,
+        "clock": sweep.clock,
     }

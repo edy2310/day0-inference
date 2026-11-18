@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 from day0.client import StreamResult
 from day0.config import HardwareConfig, SLOConfig
@@ -35,6 +36,24 @@ class RequestTimes:
     e2e_ms: float
     itl_ms: list[float] = field(default_factory=list)
     output_tokens: int = 0
+
+
+Clock = Literal["wall", "virtual"]
+
+
+def timing_clock(backend_kind: str) -> Clock:
+    """Name the clock that times the requests of one backend.
+
+    Real servers are timed with the wall clock. The fake server is timed on its simulated clock, so
+    its latencies do not depend on how fast the machine runs (docs/decisions.md, D-39).
+
+    Args:
+        backend_kind: The ``backend.kind`` of the configuration.
+
+    Returns:
+        ``"virtual"`` for the fake server, ``"wall"`` for every other backend.
+    """
+    return "virtual" if backend_kind == "fake" else "wall"
 
 
 def request_times(result: StreamResult) -> RequestTimes | None:

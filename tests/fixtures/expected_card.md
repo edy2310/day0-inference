@@ -111,6 +111,7 @@
 - GPU: fake
 - Driver: n/a; CUDA: n/a
 - Server: fake-0.1 (backend fake)
+- Timing: simulated on the fake server's virtual clock, not measured on hardware
 - day0 0.1.0; git `73310bf011e16bde8b6ec2af0318b9d1f6db39c9`
 - Started 2026-11-18T06:23:02Z; ended None
 - `ref`: 20.4 s wall time, 0.006 GPU-hours

@@ -3580,7 +3580,8 @@
     "run_name": "fake-demo",
     "seed": 1234,
     "started_utc": "2026-11-18T06:23:02Z",
-    "target_concurrency": 8
+    "target_concurrency": 8,
+    "timing_clock": "virtual"
   },
   "schema_version": 1,
   "slices": [
